@@ -1,0 +1,26 @@
+{
+    "prefix": " ",
+    "dataset": "vtab",
+    "shuffle": true,
+    "init_cls": 10,
+    "increment": 10,
+    "model_name": "tosca",
+    "backbone_type": "vit_base_patch16_224_in21k",
+    "pretrained": true,
+    "device": ["0"],
+    "seed": [1993],
+    
+    "mlp_ratio": 16,
+    "se_ratio": 16,
+    "l1": 0.0005,
+    "flow": "tosca",
+
+    "epochs": 20,
+    "batch_size": 48,
+    "optimizer": "sgd",
+    "scheduler": "cosine",
+    "lr": 0.025,
+    "weight_decay": 0,
+    "milestones": [10, 15]
+}
+
