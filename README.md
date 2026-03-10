@@ -93,6 +93,12 @@ def download_data(self):
 python main.py --config=./exps/tosca_[DATASET].json
 ```
 
+For gated task routing (collector + synthetic replay + gate), use:
+
+```bash
+python main.py --config=./exps/tosca_cifar_gate.json
+```
+
 Logs are saved to `logs/<model>/<dataset>/<init_cls>/<increment>/` and per-task TOSCA checkpoints to `tosca/task<i>.pth`.
 
 ### ⚙️ Hyperparameters
