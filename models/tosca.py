@@ -3,13 +3,51 @@ import numpy as np
 import torch
 from tqdm import tqdm
 from torch import optim
+from torch import nn
 from torch.nn import functional as F
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, TensorDataset
 from utils.inc_net import SimpleVitNet
 from models.base import BaseLearner
 from utils.toolkit import tensor2numpy
 
 num_workers = 10
+
+
+class TaskGate(nn.Module):
+    def __init__(self, input_dim, output_dim, hidden_dim=0, num_layers=1):
+        super().__init__()
+        self.input_dim = input_dim
+        self.hidden_dim = hidden_dim
+        self.num_layers = num_layers
+        self.feature_extractor = self._build_feature_extractor()
+        last_dim = input_dim if isinstance(self.feature_extractor, nn.Identity) else hidden_dim
+        self.classifier = nn.Linear(last_dim, output_dim)
+
+    def _build_feature_extractor(self):
+        if self.num_layers <= 1 or self.hidden_dim <= 0:
+            return nn.Identity()
+
+        layers = [nn.Linear(self.input_dim, self.hidden_dim), nn.ReLU(inplace=True)]
+        for _ in range(self.num_layers - 2):
+            layers.extend(
+                [nn.Linear(self.hidden_dim, self.hidden_dim), nn.ReLU(inplace=True)]
+            )
+        return nn.Sequential(*layers)
+
+    def forward(self, x):
+        x = self.feature_extractor(x)
+        return self.classifier(x)
+
+    def extend_output(self, output_dim):
+        if output_dim <= self.classifier.out_features:
+            return
+
+        old_classifier = self.classifier
+        new_classifier = nn.Linear(old_classifier.in_features, output_dim)
+        with torch.no_grad():
+            new_classifier.weight[: old_classifier.out_features].copy_(old_classifier.weight)
+            new_classifier.bias[: old_classifier.out_features].copy_(old_classifier.bias)
+        self.classifier = new_classifier.to(old_classifier.weight.device)
 
 
 class Learner(BaseLearner):
@@ -23,6 +61,20 @@ class Learner(BaseLearner):
         self._task_test_loaders = []
         # Store module selection reports after each task
         self._tosca_selection_history = []
+        self._selection_mode = args.get("selection_mode", "entropy")
+        self._enable_gate = args.get("enable_gate", False)
+        self._gate = None
+        self._class_stats = {}
+        self._gate_synthetic_features = []
+        self._gate_synthetic_labels = []
+
+        if self._enable_gate:
+            self._gate = TaskGate(
+                input_dim=self._network.feature_dim,
+                output_dim=1,
+                hidden_dim=args.get("gate_hidden_dim", 0),
+                num_layers=args.get("gate_num_layers", 1),
+            ).to(self._device)
 
     def incremental_train(self, data_manager):
         self._cur_task += 1
@@ -30,6 +82,8 @@ class Learner(BaseLearner):
             self._cur_task
         )
         self._network.update_fc(self._total_classes)
+        if self._gate is not None:
+            self._gate.extend_output(self._cur_task + 1)
 
         # Record task boundary
         self._task_ranges.append((self._known_classes, self._total_classes))
@@ -135,22 +189,142 @@ class Learner(BaseLearner):
 
         logging.info(info)
         self._save_tosca()
+        if self._gate is not None:
+            self._collect_task_statistics()
+            self._generate_gate_synthetic_samples()
+            self._train_gate()
+            self._save_gate()
 
         # ============================================================
         # TOSCA MODULE SELECTION REPORT after task training is complete
         # (all TOSCA weights are now saved to disk)
         # ============================================================
-        selection_report = self._report_tosca_module_selection(
+        entropy_report = self._report_tosca_module_selection(
             max_batches_per_task=self.args.get("selection_report_batches", 20),
             verbose=True,
+            strategy="entropy",
         )
-        self._tosca_selection_history.append(
-            {"task": self._cur_task, "selection_report": selection_report}
-        )
+        history_entry = {"task": self._cur_task, "entropy": entropy_report}
+        if self._gate is not None:
+            history_entry["gate"] = self._report_tosca_module_selection(
+                max_batches_per_task=self.args.get("selection_report_batches", 20),
+                verbose=True,
+                strategy="gate",
+            )
+        self._tosca_selection_history.append(history_entry)
 
         self.replace_fc()
 
-    def _report_tosca_module_selection(self, max_batches_per_task=20, verbose=False):
+    def _collect_task_statistics(self):
+        self._network.eval()
+        feature_buckets = {}
+
+        with torch.no_grad():
+            for _, data, labels in self.train_loader_for_protonet:
+                data = data.to(self._device)
+                features = self._extract_frozen_features(data).cpu()
+                for feature, label in zip(features, labels):
+                    class_idx = int(label.item())
+                    feature_buckets.setdefault(class_idx, []).append(feature)
+
+        for class_idx, class_features in feature_buckets.items():
+            stacked = torch.stack(class_features, dim=0)
+            self._class_stats[class_idx] = {
+                "task": self._cur_task,
+                "mean": stacked.mean(dim=0),
+                "std": stacked.std(dim=0, unbiased=False),
+                "count": stacked.size(0),
+            }
+
+        logging.info(
+            "Collected frozen-feature statistics for %d classes after task %d.",
+            len(feature_buckets),
+            self._cur_task,
+        )
+
+    def _generate_gate_synthetic_samples(self):
+        samples_per_class = self.args.get("gate_samples_per_class", 1000)
+        min_std = self.args.get("gate_min_std", 1e-4)
+        task_features = []
+        task_labels = []
+
+        for class_idx in range(self._known_classes, self._total_classes):
+            stats = self._class_stats[class_idx]
+            mean = stats["mean"]
+            std = stats["std"].clamp_min(min_std)
+            generated = torch.normal(
+                mean.expand(samples_per_class, -1),
+                std.expand(samples_per_class, -1),
+            )
+            task_features.append(generated)
+            task_labels.append(
+                torch.full((samples_per_class,), stats["task"], dtype=torch.long)
+            )
+
+        if task_features:
+            self._gate_synthetic_features.append(torch.cat(task_features, dim=0))
+            self._gate_synthetic_labels.append(torch.cat(task_labels, dim=0))
+
+        logging.info(
+            "Generated %d synthetic gate samples for task %d.",
+            sum(t.size(0) for t in task_features) if task_features else 0,
+            self._cur_task,
+        )
+
+    def _train_gate(self):
+        if self._gate is None or not self._gate_synthetic_features:
+            return
+
+        features = torch.cat(self._gate_synthetic_features, dim=0)
+        labels = torch.cat(self._gate_synthetic_labels, dim=0)
+        dataset = TensorDataset(features, labels)
+        loader = DataLoader(
+            dataset,
+            batch_size=self.args.get("gate_batch_size", 256),
+            shuffle=True,
+            num_workers=num_workers,
+        )
+        optimizer = optim.Adam(
+            self._gate.parameters(),
+            lr=self.args.get("gate_lr", 1e-3),
+            weight_decay=self.args.get("gate_weight_decay", 0.0),
+        )
+
+        self._gate.train()
+        epochs = self.args.get("gate_train_epochs", 20)
+        for epoch in range(epochs):
+            epoch_loss = 0.0
+            correct = 0
+            total = 0
+            for batch_features, batch_labels in loader:
+                batch_features = batch_features.to(self._device)
+                batch_labels = batch_labels.to(self._device)
+
+                optimizer.zero_grad()
+                logits = self._gate(batch_features)
+                loss = F.cross_entropy(logits, batch_labels)
+                loss.backward()
+                optimizer.step()
+
+                epoch_loss += loss.item()
+                predictions = torch.argmax(logits, dim=1)
+                correct += (predictions == batch_labels).sum().item()
+                total += batch_labels.size(0)
+
+            logging.info(
+                "Gate train | task %d | epoch %d/%d | loss %.4f | acc %.2f",
+                self._cur_task,
+                epoch + 1,
+                epochs,
+                epoch_loss / max(len(loader), 1),
+                100.0 * correct / max(total, 1),
+            )
+
+        self._gate.eval()
+
+    def _report_tosca_module_selection(
+        self, max_batches_per_task=20, verbose=False, strategy="entropy"
+    ):
         """
         Report expected vs selected head for each batch in each true task.
         """
@@ -167,7 +341,9 @@ class Learner(BaseLearner):
                     if batch_idx >= max_batches_per_task:
                         break
                     inputs = inputs.to(self._device)
-                    selected_task = self._get_selected_task_for_batch(inputs)
+                    selected_task = self._get_selected_task_for_batch(
+                        inputs, strategy=strategy
+                    )
                     selected_modules.append(selected_task)
 
                 num_batches = len(selected_modules)
@@ -187,7 +363,9 @@ class Learner(BaseLearner):
 
         if verbose:
             logging.info("=" * 70)
-            logging.info(f"TOSCA HEAD CHECK REPORT after Task {self._cur_task}")
+            logging.info(
+                f"TOSCA HEAD CHECK REPORT after Task {self._cur_task} [{strategy}]"
+            )
             logging.info(
                 f"Showing first {max_batches_per_task} test batches for each true task."
             )
@@ -220,10 +398,20 @@ class Learner(BaseLearner):
 
         return report
 
-    def _get_selected_task_for_batch(self, inputs):
-        """
-        For a batch, return the selected task index using average entropy.
-        """
+    def _extract_frozen_features(self, inputs):
+        return self._network.backbone.forward_features(inputs)
+
+    def _get_selected_task_for_batch(self, inputs, strategy=None):
+        strategy = strategy or self._selection_mode
+        if strategy == "gate" and self._gate is not None:
+            with torch.no_grad():
+                features = self._extract_frozen_features(inputs)
+                gate_logits = self._gate(features)
+            return int(torch.argmax(gate_logits.mean(dim=0)).item())
+
+        return self._get_entropy_selected_task_for_batch(inputs)
+
+    def _get_entropy_selected_task_for_batch(self, inputs):
         entropies = []
         for i in range(self._cur_task + 1):
             self._load_tosca(i)
@@ -299,6 +487,15 @@ class Learner(BaseLearner):
         return scheduler
 
     def get_lowentropy_logits(self, inputs):
+        return self.get_selected_logits(inputs)
+
+    def get_selected_logits(self, inputs):
+        strategy = self._selection_mode
+        if strategy == "gate" and self._gate is not None:
+            task_idx = self._get_selected_task_for_batch(inputs, strategy="gate")
+            self._load_tosca(task_idx)
+            return self._network(inputs)["logits"]
+
         entropies = []
         logits_list = []
         for i in range(self._cur_task + 1):
@@ -321,7 +518,7 @@ class Learner(BaseLearner):
         for i, (_, inputs, targets) in enumerate(loader):
             inputs, targets = inputs.to(self._device), targets.long().to(self._device)
             with torch.no_grad():
-                outputs = self.get_lowentropy_logits(inputs)
+                outputs = self.get_selected_logits(inputs)
             predicts = torch.topk(
                 outputs, k=self.topk, dim=1, largest=True, sorted=True
             )[
@@ -341,6 +538,14 @@ class Learner(BaseLearner):
         }
         torch.save(tosca_state_dict, path)
         logging.info(f"tosca parameters saved to {path}.")
+
+    def _save_gate(self):
+        if self._gate is None:
+            return
+
+        path = f"tosca/gate_task{self._cur_task}.pth"
+        torch.save(self._gate.state_dict(), path)
+        logging.info(f"gate parameters saved to {path}.")
 
     def _load_tosca(self, idx):
         path = f"tosca/task{idx}.pth"
