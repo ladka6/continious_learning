@@ -217,59 +217,12 @@ class Learner(BaseLearner):
             len(class_stats),
         )
 
-    def _collect_current_task_real_features(self):
-        self._network.eval()
-        all_features, all_labels = [], []
-
-        with torch.no_grad():
-            for _, data, label in self.train_loader_for_protonet:
-                data = data.to(self._device)
-                features = self._extract_backbone_features(data)
-                features = self._prepare_gate_features(features)
-                all_features.append(features.cpu())
-                all_labels.append(label.long().cpu())
-
-        if len(all_features) == 0:
-            return (
-                torch.empty(0, self._network.feature_dim),
-                torch.empty(0, dtype=torch.long),
-            )
-
-        features = torch.cat(all_features, dim=0)
-        labels = torch.cat(all_labels, dim=0)
-
-        max_per_class = int(self.args.get("gate_real_per_class", 200))
-        if max_per_class > 0:
-            selected_indices = []
-            for class_id in labels.unique(sorted=True):
-                class_mask = labels == class_id
-                class_indices = torch.where(class_mask)[0]
-                if class_indices.numel() > max_per_class:
-                    perm = torch.randperm(class_indices.numel())[:max_per_class]
-                    class_indices = class_indices[perm]
-                selected_indices.append(class_indices)
-
-            if len(selected_indices) > 0:
-                selected_indices = torch.cat(selected_indices, dim=0)
-                features = features[selected_indices]
-
-        task_targets = torch.full(
-            (features.size(0),), self._cur_task, dtype=torch.long
-        )
-        return features, task_targets
-
-    def _collect_previous_synthetic_features(self):
-        if self._cur_task <= 0:
-            return (
-                torch.empty(0, self._network.feature_dim),
-                torch.empty(0, dtype=torch.long),
-            )
-
+    def _collect_all_synthetic_features(self):
         synthetic_per_class = int(self.args.get("gate_synthetic_per_class", 200))
         min_variance = self.args.get("gate_min_variance", 1e-6)
 
         all_features, all_targets = [], []
-        for task_idx in range(self._cur_task):
+        for task_idx in range(self._cur_task + 1):
             class_stats = self._task_feature_stats.get(task_idx, {})
             sampled_features, _ = generate_samples(
                 class_stats,
@@ -279,7 +232,6 @@ class Learner(BaseLearner):
             )
             if sampled_features.numel() == 0:
                 continue
-            sampled_features = self._prepare_gate_features(sampled_features)
             task_targets = torch.full(
                 (sampled_features.size(0),), task_idx, dtype=torch.long
             )
@@ -309,18 +261,11 @@ class Learner(BaseLearner):
     def _train_gate(self):
         self._init_or_extend_gate()
 
-        prev_x, prev_y = self._collect_previous_synthetic_features()
-        curr_x, curr_y = self._collect_current_task_real_features()
+        train_x, train_y = self._collect_all_synthetic_features()
 
-        if curr_x.numel() == 0:
-            logging.warning("No current-task features available for gate training.")
+        if train_x.numel() == 0:
+            logging.warning("No synthetic features available for gate training.")
             return
-
-        if prev_x.numel() == 0:
-            train_x, train_y = curr_x, curr_y
-        else:
-            train_x = torch.cat([prev_x, curr_x], dim=0)
-            train_y = torch.cat([prev_y, curr_y], dim=0)
 
         gate_batch_size = int(self.args.get("gate_batch_size", 256))
         gate_epochs = int(self.args.get("gate_epochs", 10))
