@@ -189,6 +189,13 @@ class Learner(BaseLearner):
         backbone = self._get_backbone()
         return backbone.forward_features(inputs)
 
+    def _extract_tosca_features(self, inputs, task_idx=None):
+        if task_idx is not None:
+            self._load_tosca(task_idx)
+
+        backbone = self._get_backbone()
+        return backbone(inputs)
+
     def _prepare_gate_features(self, features):
         if self.args.get("gate_normalize_features", True):
             return F.normalize(features, p=2, dim=1)
@@ -202,9 +209,10 @@ class Learner(BaseLearner):
         )
 
         with torch.no_grad():
+            self._load_tosca(self._cur_task)
             for _, data, label in self.train_loader_for_protonet:
                 data = data.to(self._device)
-                features = self._extract_backbone_features(data)
+                features = self._extract_tosca_features(data)
                 features = self._prepare_gate_features(features)
                 collector.update(features, label)
 
@@ -351,11 +359,16 @@ class Learner(BaseLearner):
             return self._get_selected_task_for_batch_entropy(inputs)
 
         self._gate.eval()
-        features = self._extract_backbone_features(inputs)
-        features = self._prepare_gate_features(features)
-        logits = self._gate(features)
-        probs = F.softmax(logits, dim=1).mean(dim=0)
-        return int(torch.argmax(probs).item())
+        candidate_scores = []
+
+        for task_idx in range(self._cur_task + 1):
+            features = self._extract_tosca_features(inputs, task_idx=task_idx)
+            features = self._prepare_gate_features(features)
+            logits = self._gate(features)
+            probs = F.softmax(logits, dim=1)
+            candidate_scores.append(probs[:, task_idx].mean().item())
+
+        return int(np.argmax(candidate_scores))
 
     def _get_selected_task_for_batch(self, inputs, selector=None):
         selector = (selector or self._routing_mode).lower()
