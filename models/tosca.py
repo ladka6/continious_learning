@@ -99,6 +99,8 @@ class Learner(BaseLearner):
         optimizer = self.get_optimizer(lr=self.args["lr"])
         scheduler = self.get_scheduler(optimizer, self.args["epochs"])
 
+        val_interval = int(self.args.get("val_epoch_interval", 1))
+
         prog_bar = tqdm(range(self.args["epochs"]))
         for _, epoch in enumerate(prog_bar):
             self._network.train()
@@ -128,25 +130,28 @@ class Learner(BaseLearner):
                 scheduler.step()
             train_acc = np.around(tensor2numpy(correct) * 100 / total, decimals=2)
 
-            if epoch % 5 == 0:
-                test_acc = self._compute_accuracy(self._network, self.test_loader)
-                info = "Task {}, Epoch {}/{} => Loss {:.3f}, Train_accy {:.2f}, Test_accy {:.2f}".format(
-                    self._cur_task,
-                    epoch + 1,
-                    self.args["epochs"],
-                    losses / len(self.train_loader),
-                    train_acc,
-                    test_acc,
-                )
-            else:
-                info = "Task {}, Epoch {}/{} => Loss {:.3f}, Train_accy {:.2f}".format(
-                    self._cur_task,
-                    epoch + 1,
-                    self.args["epochs"],
-                    losses / len(self.train_loader),
-                    train_acc,
-                )
+            info = "Task {}, Epoch {}/{} => Loss {:.3f}, Train_accy {:.2f}".format(
+                self._cur_task,
+                epoch + 1,
+                self.args["epochs"],
+                losses / len(self.train_loader),
+                train_acc,
+            )
             prog_bar.set_description(info)
+
+            if (epoch + 1) % val_interval == 0:
+                y_pred, y_true = self._eval_no_routing(self.test_loader)
+                val_accy = self._evaluate(y_pred, y_true)
+                logging.info(
+                    "Task {}, Epoch {}/{} => Loss {:.3f}, Train_accy {:.2f}, Val_grouped: {}".format(
+                        self._cur_task,
+                        epoch + 1,
+                        self.args["epochs"],
+                        losses / len(self.train_loader),
+                        train_acc,
+                        val_accy["grouped"],
+                    )
+                )
 
         logging.info(info)
         self._save_tosca()
@@ -254,9 +259,14 @@ class Learner(BaseLearner):
                 num_tasks=num_tasks,
                 hidden_dim=int(self.args.get("gate_hidden_dim", 0)),
             ).to(self._device)
+            logging.info("Gate initialized for Task 0 (1 task).")
         else:
             self._gate.extend(num_tasks)
             self._gate.to(self._device)
+            logging.info(
+                "Gate extended to %d tasks (weights from previous tasks preserved).",
+                num_tasks,
+            )
 
     def _train_gate(self):
         self._init_or_extend_gate()
@@ -452,6 +462,26 @@ class Learner(BaseLearner):
             logging.info(
                 f"TOSCA HEAD CHECK REPORT ({selector.upper()}) after Task {self._cur_task}"
             )
+
+            # Routing summary
+            total_batches = sum(entry["num_batches"] for entry in report.values())
+            routing_counts = {t: 0 for t in range(num_tasks)}
+            expected_counts = {t: report[t]["num_batches"] for t in range(num_tasks)}
+            for entry in report.values():
+                for sel in entry["selected_modules"]:
+                    routing_counts[sel] += 1
+
+            routed_str = "  ".join(f"T{t}={routing_counts[t]}" for t in range(num_tasks))
+            expected_str = "  ".join(f"T{t}={expected_counts[t]}" for t in range(num_tasks))
+            match_str = "  ".join(
+                f"T{t}={report[t]['num_correct']}/{report[t]['num_batches']} ({report[t]['task_match_acc']:.1f}%)"
+                for t in range(num_tasks)
+            )
+            logging.info(f"=== ROUTING SUMMARY ({total_batches} batches total, {max_batches_per_task} per task) ===")
+            logging.info(f"Batches routed to:  {routed_str}")
+            logging.info(f"Expected from data: {expected_str}")
+            logging.info(f"Per-task match:     {match_str}")
+
             logging.info(
                 f"Showing first {max_batches_per_task} test batches for each true task."
             )
@@ -570,6 +600,21 @@ class Learner(BaseLearner):
             ]
             y_pred.append(predicts.cpu().numpy())
             y_true.append(targets.cpu().numpy())
+
+        return np.concatenate(y_pred), np.concatenate(y_true)
+
+    def _eval_no_routing(self, loader):
+        """Evaluate using current network state without routing (for per-epoch validation)."""
+        self._network.eval()
+        y_pred, y_true = [], []
+
+        with torch.no_grad():
+            for _, inputs, targets in loader:
+                inputs, targets = inputs.to(self._device), targets.long().to(self._device)
+                outputs = self._network(inputs)["logits"]
+                predicts = torch.topk(outputs, k=self.topk, dim=1, largest=True, sorted=True)[1]
+                y_pred.append(predicts.cpu().numpy())
+                y_true.append(targets.cpu().numpy())
 
         return np.concatenate(y_pred), np.concatenate(y_true)
 
