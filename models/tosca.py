@@ -140,16 +140,20 @@ class Learner(BaseLearner):
             prog_bar.set_description(info)
 
             if (epoch + 1) % val_interval == 0:
-                y_pred, y_true = self._eval_no_routing(self.test_loader)
-                val_accy = self._evaluate(y_pred, y_true)
+                per_task_accs = self._eval_all_tasks_validation()
+                avg_acc = np.mean(per_task_accs)
+                task_str = "  ".join(
+                    f"T{t}={acc:.2f}%" for t, acc in enumerate(per_task_accs)
+                )
                 logging.info(
-                    "Task {}, Epoch {}/{} => Loss {:.3f}, Train_accy {:.2f}, Val_grouped: {}".format(
+                    "Task {}, Epoch {}/{} => Loss {:.3f}, Train_accy {:.2f}, Val per-task: {}  (avg={:.2f}%)".format(
                         self._cur_task,
                         epoch + 1,
                         self.args["epochs"],
                         losses / len(self.train_loader),
                         train_acc,
-                        val_accy["grouped"],
+                        task_str,
+                        avg_acc,
                     )
                 )
 
