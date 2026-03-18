@@ -622,6 +622,47 @@ class Learner(BaseLearner):
 
         return np.concatenate(y_pred), np.concatenate(y_true)
 
+    def _eval_all_tasks_validation(self):
+        """
+        Per-epoch validation: evaluate each task with its correct TOSCA module.
+        For previous tasks (0..cur_task-1): load their saved TOSCA, eval on their test loader.
+        For the current task: use the current (in-training) network state.
+        Returns a list of top-1 accuracies, one per task.
+        """
+        # Save current TOSCA weights so we can restore after loading old ones
+        current_tosca = {
+            name: param.clone()
+            for name, param in self._network.state_dict().items()
+            if "tosca" in name
+        }
+
+        accs = []
+        self._network.eval()
+        with torch.no_grad():
+            for task_idx in range(self._cur_task + 1):
+                loader = self._task_test_loaders[task_idx]
+
+                if task_idx < self._cur_task:
+                    self._load_tosca(task_idx)
+
+                correct, total = 0, 0
+                for _, inputs, targets in loader:
+                    inputs, targets = inputs.to(self._device), targets.long().to(self._device)
+                    outputs = self._network(inputs)["logits"]
+                    preds = torch.argmax(outputs, dim=1)
+                    correct += (preds == targets).sum().item()
+                    total += targets.size(0)
+
+                accs.append(np.around(100.0 * correct / max(total, 1), decimals=2))
+
+        # Restore current TOSCA state for continued training
+        state = self._network.state_dict()
+        state.update(current_tosca)
+        self._network.load_state_dict(state)
+        self._network.train()
+
+        return accs
+
     def _save_tosca(self):
         path = f"tosca/task{self._cur_task}.pth"
         tosca_state_dict = {
