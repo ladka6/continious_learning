@@ -159,8 +159,12 @@ class Learner(BaseLearner):
             verbose=True,
             selector="entropy",
         )
+        entropy_validation_routing = self._log_validation_routing_distribution(
+            selector="entropy"
+        )
 
         gate_report = None
+        gate_validation_routing = None
         if self._use_gate:
             self._collect_current_task_statistics()
             self._train_gate()
@@ -169,12 +173,17 @@ class Learner(BaseLearner):
                 verbose=True,
                 selector="gate",
             )
+            gate_validation_routing = self._log_validation_routing_distribution(
+                selector="gate"
+            )
 
         self._tosca_selection_history.append(
             {
                 "task": self._cur_task,
                 "entropy": entropy_report,
+                "entropy_validation_routing": entropy_validation_routing,
                 "gate": gate_report,
+                "gate_validation_routing": gate_validation_routing,
             }
         )
 
@@ -370,6 +379,84 @@ class Learner(BaseLearner):
         self._load_tosca(task_idx)
         return self._network(inputs)["logits"]
 
+    def _format_task_count_summary(self, selected_modules):
+        if not selected_modules:
+            return "none"
+
+        counts = {
+            task_idx: 0 for task_idx in range(self._cur_task + 1)
+        }
+        for task_idx in selected_modules:
+            counts[task_idx] = counts.get(task_idx, 0) + 1
+
+        return ", ".join(
+            f"T{task_idx}:{count}" for task_idx, count in counts.items() if count > 0
+        )
+
+    def _format_batch_preview(self, selected_modules, limit=10):
+        if not selected_modules:
+            return "none"
+
+        preview = " ".join(
+            f"B{idx + 1:02d}->T{task_idx}"
+            for idx, task_idx in enumerate(selected_modules[:limit])
+        )
+        if len(selected_modules) > limit:
+            preview += " ..."
+        return preview
+
+    def _log_validation_routing_distribution(self, selector=None, max_batches=None):
+        self._network.eval()
+        selector = (selector or self._routing_mode).lower()
+        max_batches = self.args.get("validation_routing_batches", max_batches)
+        selected_counts = {task_idx: 0 for task_idx in range(self._cur_task + 1)}
+        total_batches = 0
+
+        with torch.no_grad():
+            for batch_idx, (_, inputs, _) in enumerate(self.test_loader):
+                if max_batches is not None and batch_idx >= max_batches:
+                    break
+
+                inputs = inputs.to(self._device)
+                selected_task = self._get_selected_task_for_batch(
+                    inputs, selector=selector
+                )
+                selected_counts[selected_task] = (
+                    selected_counts.get(selected_task, 0) + 1
+                )
+                total_batches += 1
+
+        distribution = {
+            task_idx: {
+                "count": count,
+                "ratio": (100.0 * count / total_batches) if total_batches > 0 else 0.0,
+            }
+            for task_idx, count in selected_counts.items()
+        }
+
+        logging.info("=" * 70)
+        logging.info(
+            "VALIDATION ROUTING DISTRIBUTION (%s) after Task %d",
+            selector.upper(),
+            self._cur_task,
+        )
+        logging.info("Total validation batches checked: %d", total_batches)
+        for task_idx in range(self._cur_task + 1):
+            entry = distribution[task_idx]
+            logging.info(
+                "  Routed to Task %d: %d batches (%.1f%%)",
+                task_idx,
+                entry["count"],
+                entry["ratio"],
+            )
+        logging.info("=" * 70)
+
+        return {
+            "selector": selector,
+            "total_batches": total_batches,
+            "distribution": distribution,
+        }
+
     def _report_tosca_module_selection(
         self, max_batches_per_task=20, verbose=False, selector="entropy"
     ):
@@ -440,6 +527,10 @@ class Learner(BaseLearner):
                     "expected_task": true_task,
                     "num_batches": num_batches,
                     "selected_modules": selected_modules,
+                    "selected_task_counts": {
+                        task_idx: selected_modules.count(task_idx)
+                        for task_idx in range(num_tasks)
+                    },
                     "wrong_batches": wrong_batches,
                     "num_correct": num_correct,
                     "task_match_acc": task_match_acc,
@@ -450,37 +541,37 @@ class Learner(BaseLearner):
         if verbose:
             logging.info("=" * 70)
             logging.info(
-                f"TOSCA HEAD CHECK REPORT ({selector.upper()}) after Task {self._cur_task}"
+                f"TOSCA ROUTING REPORT ({selector.upper()}) after Task {self._cur_task}"
             )
             logging.info(
-                f"Showing first {max_batches_per_task} test batches for each true task."
+                f"Per-task validation summary over first {max_batches_per_task} batches."
             )
             for true_task in range(num_tasks):
                 start_cls, end_cls = self._task_ranges[true_task]
                 entry = report[true_task]
-                selected_line = " ".join(
-                    [
-                        f"B{idx + 1:02d}:T{mod}"
-                        for idx, mod in enumerate(entry["selected_modules"])
-                    ]
+                logging.info(
+                    f"[True Task {true_task}] classes {start_cls}-{end_cls - 1}"
                 )
                 logging.info(
-                    f"[True Task {true_task}] classes {start_cls}-{end_cls - 1} | expected head: T{true_task}"
+                    f"  Expected route      : T{true_task}"
                 )
                 logging.info(
-                    f"  Selected heads      : {selected_line if selected_line else 'no batches'}"
+                    f"  Routed batch counts : {self._format_task_count_summary(entry['selected_modules'])}"
                 )
                 logging.info(
-                    f"  Wrong batches       : {', '.join(entry['wrong_batches']) if entry['wrong_batches'] else 'none'}"
+                    f"  Routing accuracy    : {entry['num_correct']}/{entry['num_batches']} ({entry['task_match_acc']:.1f}%)"
                 )
                 logging.info(
-                    f"  Task match          : {entry['num_correct']}/{entry['num_batches']} ({entry['task_match_acc']:.1f}%)"
-                )
-                logging.info(
-                    f"  Class acc (selected): {entry['selected_cls_acc']:.2f}%"
+                    f"  Class acc (routed)  : {entry['selected_cls_acc']:.2f}%"
                 )
                 logging.info(
                     f"  Class acc (oracle)  : {entry['oracle_cls_acc']:.2f}%"
+                )
+                logging.info(
+                    f"  Batch preview       : {self._format_batch_preview(entry['selected_modules'])}"
+                )
+                logging.info(
+                    f"  Wrong batch ids     : {', '.join(entry['wrong_batches']) if entry['wrong_batches'] else 'none'}"
                 )
             logging.info("=" * 70)
 
