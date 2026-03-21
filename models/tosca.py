@@ -639,11 +639,10 @@ class Learner(BaseLearner):
             )
         return scheduler
 
-    def _eval_cnn(self, loader):
+    def _eval_cnn_for_selector(self, loader, selector):
         self._network.eval()
         y_pred, y_true = [], []
 
-        selector = self._routing_mode if self._use_gate else "entropy"
         for _, (_, inputs, targets) in enumerate(loader):
             inputs, targets = inputs.to(self._device), targets.long().to(self._device)
             with torch.no_grad():
@@ -655,6 +654,21 @@ class Learner(BaseLearner):
             y_true.append(targets.cpu().numpy())
 
         return np.concatenate(y_pred), np.concatenate(y_true)
+
+    def eval_routing_comparison(self):
+        if not self._use_gate:
+            return None
+
+        comparisons = {}
+        for selector in ("entropy", "gate"):
+            y_pred, y_true = self._eval_cnn_for_selector(self.test_loader, selector)
+            comparisons[selector] = self._evaluate(y_pred, y_true)
+
+        return comparisons
+
+    def _eval_cnn(self, loader):
+        selector = self._routing_mode if self._use_gate else "entropy"
+        return self._eval_cnn_for_selector(loader, selector)
 
     def _save_tosca(self):
         path = f"tosca/task{self._cur_task}.pth"
