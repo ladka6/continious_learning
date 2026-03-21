@@ -145,41 +145,79 @@ class Learner(BaseLearner):
 
         report_batches = self.args.get("selection_report_batches", 20)
 
-        # Baseline analysis with entropy routing
-        entropy_report = self._report_tosca_module_selection(
+        # Pre-classifier-update diagnostics
+        entropy_report_pre_fc = self._report_tosca_module_selection(
             max_batches_per_task=report_batches,
             verbose=True,
             selector="entropy",
+            stage_label="PRE-FC",
         )
-        entropy_validation_routing = self._log_validation_routing_distribution(
-            selector="entropy"
+        entropy_validation_routing_pre_fc = self._log_validation_routing_distribution(
+            selector="entropy",
+            stage_label="PRE-FC",
         )
 
-        gate_report = None
-        gate_validation_routing = None
+        gate_report_pre_fc = None
+        gate_validation_routing_pre_fc = None
         if self._use_gate:
             self._collect_current_task_statistics()
             self._train_gate()
-            gate_report = self._report_tosca_module_selection(
+            gate_report_pre_fc = self._report_tosca_module_selection(
                 max_batches_per_task=report_batches,
                 verbose=True,
                 selector="gate",
+                stage_label="PRE-FC",
             )
-            gate_validation_routing = self._log_validation_routing_distribution(
-                selector="gate"
+            gate_validation_routing_pre_fc = self._log_validation_routing_distribution(
+                selector="gate",
+                stage_label="PRE-FC",
+            )
+
+        self.replace_fc()
+
+        # Post-classifier-update diagnostics aligned with final CNN evaluation
+        entropy_report_post_fc = self._report_tosca_module_selection(
+            max_batches_per_task=report_batches,
+            verbose=True,
+            selector="entropy",
+            stage_label="POST-FC",
+        )
+        entropy_validation_routing_post_fc = self._log_validation_routing_distribution(
+            selector="entropy",
+            stage_label="POST-FC",
+        )
+
+        gate_report_post_fc = None
+        gate_validation_routing_post_fc = None
+        if self._use_gate:
+            gate_report_post_fc = self._report_tosca_module_selection(
+                max_batches_per_task=report_batches,
+                verbose=True,
+                selector="gate",
+                stage_label="POST-FC",
+            )
+            gate_validation_routing_post_fc = self._log_validation_routing_distribution(
+                selector="gate",
+                stage_label="POST-FC",
             )
 
         self._tosca_selection_history.append(
             {
                 "task": self._cur_task,
-                "entropy": entropy_report,
-                "entropy_validation_routing": entropy_validation_routing,
-                "gate": gate_report,
-                "gate_validation_routing": gate_validation_routing,
+                "pre_fc": {
+                    "entropy": entropy_report_pre_fc,
+                    "entropy_validation_routing": entropy_validation_routing_pre_fc,
+                    "gate": gate_report_pre_fc,
+                    "gate_validation_routing": gate_validation_routing_pre_fc,
+                },
+                "post_fc": {
+                    "entropy": entropy_report_post_fc,
+                    "entropy_validation_routing": entropy_validation_routing_post_fc,
+                    "gate": gate_report_post_fc,
+                    "gate_validation_routing": gate_validation_routing_post_fc,
+                },
             }
         )
-
-        self.replace_fc()
 
     def _get_backbone(self):
         if isinstance(self._network, torch.nn.DataParallel):
@@ -397,10 +435,13 @@ class Learner(BaseLearner):
             preview += " ..."
         return preview
 
-    def _log_validation_routing_distribution(self, selector=None, max_batches=None):
+    def _log_validation_routing_distribution(
+        self, selector=None, max_batches=None, stage_label=None
+    ):
         self._network.eval()
         selector = (selector or self._routing_mode).lower()
         max_batches = self.args.get("validation_routing_batches", max_batches)
+        stage_label = stage_label or "CURRENT"
         selected_counts = {task_idx: 0 for task_idx in range(self._cur_task + 1)}
         total_batches = 0
 
@@ -428,8 +469,9 @@ class Learner(BaseLearner):
 
         logging.info("=" * 70)
         logging.info(
-            "VALIDATION ROUTING DISTRIBUTION (%s) after Task %d",
+            "VALIDATION ROUTING DISTRIBUTION (%s, %s) after Task %d",
             selector.upper(),
+            stage_label,
             self._cur_task,
         )
         logging.info("Total validation batches checked: %d", total_batches)
@@ -445,12 +487,17 @@ class Learner(BaseLearner):
 
         return {
             "selector": selector,
+            "stage": stage_label,
             "total_batches": total_batches,
             "distribution": distribution,
         }
 
     def _report_tosca_module_selection(
-        self, max_batches_per_task=20, verbose=False, selector="entropy"
+        self,
+        max_batches_per_task=20,
+        verbose=False,
+        selector="entropy",
+        stage_label=None,
     ):
         """
         Report expected vs selected task head for each batch in each true task.
@@ -458,6 +505,7 @@ class Learner(BaseLearner):
         """
         self._network.eval()
         selector = selector.lower()
+        stage_label = stage_label or "CURRENT"
         num_tasks = self._cur_task + 1
         report = {}
 
@@ -533,7 +581,7 @@ class Learner(BaseLearner):
         if verbose:
             logging.info("=" * 70)
             logging.info(
-                f"TOSCA ROUTING REPORT ({selector.upper()}) after Task {self._cur_task}"
+                f"TOSCA ROUTING REPORT ({selector.upper()}, {stage_label}) after Task {self._cur_task}"
             )
             logging.info(
                 f"Per-task validation summary over first {max_batches_per_task} batches."
