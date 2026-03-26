@@ -22,10 +22,6 @@ class Learner(BaseLearner):
 
         # Task boundaries: task_ranges[i] = (start_class, end_class)
         self._task_ranges = []
-        # Task-specific test loaders for head-selection reports
-        self._task_test_loaders = []
-        # Selection history per task
-        self._tosca_selection_history = []
 
         # Routing strategy: "entropy" (baseline) or "gate"
         self._routing_mode = args.get(
@@ -69,16 +65,6 @@ class Learner(BaseLearner):
         self.test_loader = DataLoader(
             test_dataset, batch_size=48, shuffle=False, num_workers=num_workers
         )
-
-        task_test_dataset = data_manager.get_dataset(
-            np.arange(self._known_classes, self._total_classes),
-            source="test",
-            mode="test",
-        )
-        task_test_loader = DataLoader(
-            task_test_dataset, batch_size=48, shuffle=False, num_workers=num_workers
-        )
-        self._task_test_loaders.append(task_test_loader)
 
         train_dataset_for_protonet = data_manager.get_dataset(
             np.arange(self._known_classes, self._total_classes),
@@ -143,81 +129,11 @@ class Learner(BaseLearner):
         logging.info(info)
         self._save_tosca()
 
-        report_batches = self.args.get("selection_report_batches", 20)
-
-        # Pre-classifier-update diagnostics
-        entropy_report_pre_fc = self._report_tosca_module_selection(
-            max_batches_per_task=report_batches,
-            verbose=True,
-            selector="entropy",
-            stage_label="PRE-FC",
-        )
-        entropy_validation_routing_pre_fc = self._log_validation_routing_distribution(
-            selector="entropy",
-            stage_label="PRE-FC",
-        )
-
-        gate_report_pre_fc = None
-        gate_validation_routing_pre_fc = None
         if self._use_gate:
             self._collect_current_task_statistics()
             self._train_gate()
-            gate_report_pre_fc = self._report_tosca_module_selection(
-                max_batches_per_task=report_batches,
-                verbose=True,
-                selector="gate",
-                stage_label="PRE-FC",
-            )
-            gate_validation_routing_pre_fc = self._log_validation_routing_distribution(
-                selector="gate",
-                stage_label="PRE-FC",
-            )
 
         self.replace_fc()
-
-        # Post-classifier-update diagnostics aligned with final CNN evaluation
-        entropy_report_post_fc = self._report_tosca_module_selection(
-            max_batches_per_task=report_batches,
-            verbose=True,
-            selector="entropy",
-            stage_label="POST-FC",
-        )
-        entropy_validation_routing_post_fc = self._log_validation_routing_distribution(
-            selector="entropy",
-            stage_label="POST-FC",
-        )
-
-        gate_report_post_fc = None
-        gate_validation_routing_post_fc = None
-        if self._use_gate:
-            gate_report_post_fc = self._report_tosca_module_selection(
-                max_batches_per_task=report_batches,
-                verbose=True,
-                selector="gate",
-                stage_label="POST-FC",
-            )
-            gate_validation_routing_post_fc = self._log_validation_routing_distribution(
-                selector="gate",
-                stage_label="POST-FC",
-            )
-
-        self._tosca_selection_history.append(
-            {
-                "task": self._cur_task,
-                "pre_fc": {
-                    "entropy": entropy_report_pre_fc,
-                    "entropy_validation_routing": entropy_validation_routing_pre_fc,
-                    "gate": gate_report_pre_fc,
-                    "gate_validation_routing": gate_validation_routing_pre_fc,
-                },
-                "post_fc": {
-                    "entropy": entropy_report_post_fc,
-                    "entropy_validation_routing": entropy_validation_routing_post_fc,
-                    "gate": gate_report_post_fc,
-                    "gate_validation_routing": gate_validation_routing_post_fc,
-                },
-            }
-        )
 
     def _get_backbone(self):
         if isinstance(self._network, torch.nn.DataParallel):
@@ -249,12 +165,6 @@ class Learner(BaseLearner):
 
         class_stats = collector.compute_mean_variance()
         self._task_feature_stats[self._cur_task] = class_stats
-
-        logging.info(
-            "Collected gate feature statistics for Task %d (%d classes).",
-            self._cur_task,
-            len(class_stats),
-        )
 
     def _collect_all_synthetic_features(self):
         synthetic_per_class = int(self.args.get("gate_synthetic_per_class", 200))
@@ -343,15 +253,6 @@ class Learner(BaseLearner):
                 correct += (preds == task_ids).sum().item()
                 total += task_ids.size(0)
 
-            acc = 100.0 * correct / max(total, 1)
-            logging.info(
-                "Gate Task %d, Epoch %d/%d => Loss %.4f, TaskSelAcc %.2f",
-                self._cur_task,
-                epoch + 1,
-                gate_epochs,
-                epoch_loss / max(len(gate_loader), 1),
-                acc,
-            )
 
         self._gate.eval()
         self._save_gate()
@@ -408,214 +309,6 @@ class Learner(BaseLearner):
         task_idx = self._get_selected_task_for_batch(inputs, selector=selector)
         self._load_tosca(task_idx)
         return self._network(inputs)["logits"]
-
-    def _format_task_count_summary(self, selected_modules):
-        if not selected_modules:
-            return "none"
-
-        counts = {
-            task_idx: 0 for task_idx in range(self._cur_task + 1)
-        }
-        for task_idx in selected_modules:
-            counts[task_idx] = counts.get(task_idx, 0) + 1
-
-        return ", ".join(
-            f"T{task_idx}:{count}" for task_idx, count in counts.items() if count > 0
-        )
-
-    def _format_batch_preview(self, selected_modules, limit=10):
-        if not selected_modules:
-            return "none"
-
-        preview = " ".join(
-            f"B{idx + 1:02d}->T{task_idx}"
-            for idx, task_idx in enumerate(selected_modules[:limit])
-        )
-        if len(selected_modules) > limit:
-            preview += " ..."
-        return preview
-
-    def _log_validation_routing_distribution(
-        self, selector=None, max_batches=None, stage_label=None
-    ):
-        self._network.eval()
-        selector = (selector or self._routing_mode).lower()
-        max_batches = self.args.get("validation_routing_batches", max_batches)
-        stage_label = stage_label or "CURRENT"
-        selected_counts = {task_idx: 0 for task_idx in range(self._cur_task + 1)}
-        total_batches = 0
-
-        with torch.no_grad():
-            for batch_idx, (_, inputs, _) in enumerate(self.test_loader):
-                if max_batches is not None and batch_idx >= max_batches:
-                    break
-
-                inputs = inputs.to(self._device)
-                selected_task = self._get_selected_task_for_batch(
-                    inputs, selector=selector
-                )
-                selected_counts[selected_task] = (
-                    selected_counts.get(selected_task, 0) + 1
-                )
-                total_batches += 1
-
-        distribution = {
-            task_idx: {
-                "count": count,
-                "ratio": (100.0 * count / total_batches) if total_batches > 0 else 0.0,
-            }
-            for task_idx, count in selected_counts.items()
-        }
-
-        logging.info("=" * 70)
-        logging.info(
-            "VALIDATION ROUTING DISTRIBUTION (%s, %s) after Task %d",
-            selector.upper(),
-            stage_label,
-            self._cur_task,
-        )
-        logging.info("Total validation batches checked: %d", total_batches)
-        for task_idx in range(self._cur_task + 1):
-            entry = distribution[task_idx]
-            logging.info(
-                "  Routed to Task %d: %d batches (%.1f%%)",
-                task_idx,
-                entry["count"],
-                entry["ratio"],
-            )
-        logging.info("=" * 70)
-
-        return {
-            "selector": selector,
-            "stage": stage_label,
-            "total_batches": total_batches,
-            "distribution": distribution,
-        }
-
-    def _report_tosca_module_selection(
-        self,
-        max_batches_per_task=20,
-        verbose=False,
-        selector="entropy",
-        stage_label=None,
-    ):
-        """
-        Report expected vs selected task head for each batch in each true task.
-        Also reports classification accuracy with selected head and true (oracle) head.
-        """
-        self._network.eval()
-        selector = selector.lower()
-        stage_label = stage_label or "CURRENT"
-        num_tasks = self._cur_task + 1
-        report = {}
-
-        with torch.no_grad():
-            for true_task in range(num_tasks):
-                loader = self._task_test_loaders[true_task]
-                selected_modules = []
-                selected_cls_correct = 0
-                oracle_cls_correct = 0
-                total_samples = 0
-
-                for batch_idx, (_, inputs, targets) in enumerate(loader):
-                    if batch_idx >= max_batches_per_task:
-                        break
-
-                    inputs = inputs.to(self._device)
-                    targets = targets.long().to(self._device)
-
-                    selected_task = self._get_selected_task_for_batch(
-                        inputs, selector=selector
-                    )
-                    selected_modules.append(selected_task)
-
-                    self._load_tosca(selected_task)
-                    selected_logits = self._network(inputs)["logits"]
-                    selected_preds = torch.argmax(selected_logits, dim=1)
-                    selected_cls_correct += (selected_preds == targets).sum().item()
-
-                    self._load_tosca(true_task)
-                    oracle_logits = self._network(inputs)["logits"]
-                    oracle_preds = torch.argmax(oracle_logits, dim=1)
-                    oracle_cls_correct += (oracle_preds == targets).sum().item()
-
-                    total_samples += targets.size(0)
-
-                num_batches = len(selected_modules)
-                wrong_batches = [
-                    f"B{idx + 1:02d}->T{sel}"
-                    for idx, sel in enumerate(selected_modules)
-                    if sel != true_task
-                ]
-                num_correct = num_batches - len(wrong_batches)
-
-                task_match_acc = (
-                    100.0 * num_correct / num_batches if num_batches > 0 else 0.0
-                )
-                selected_cls_acc = (
-                    100.0 * selected_cls_correct / total_samples
-                    if total_samples > 0
-                    else 0.0
-                )
-                oracle_cls_acc = (
-                    100.0 * oracle_cls_correct / total_samples
-                    if total_samples > 0
-                    else 0.0
-                )
-
-                report[true_task] = {
-                    "expected_task": true_task,
-                    "num_batches": num_batches,
-                    "selected_modules": selected_modules,
-                    "selected_task_counts": {
-                        task_idx: selected_modules.count(task_idx)
-                        for task_idx in range(num_tasks)
-                    },
-                    "wrong_batches": wrong_batches,
-                    "num_correct": num_correct,
-                    "task_match_acc": task_match_acc,
-                    "selected_cls_acc": selected_cls_acc,
-                    "oracle_cls_acc": oracle_cls_acc,
-                }
-
-        if verbose:
-            logging.info("=" * 70)
-            logging.info(
-                f"TOSCA ROUTING REPORT ({selector.upper()}, {stage_label}) after Task {self._cur_task}"
-            )
-            logging.info(
-                f"Per-task validation summary over first {max_batches_per_task} batches."
-            )
-            for true_task in range(num_tasks):
-                start_cls, end_cls = self._task_ranges[true_task]
-                entry = report[true_task]
-                logging.info(
-                    f"[True Task {true_task}] classes {start_cls}-{end_cls - 1}"
-                )
-                logging.info(
-                    f"  Expected route      : T{true_task}"
-                )
-                logging.info(
-                    f"  Routed batch counts : {self._format_task_count_summary(entry['selected_modules'])}"
-                )
-                logging.info(
-                    f"  Routing accuracy    : {entry['num_correct']}/{entry['num_batches']} ({entry['task_match_acc']:.1f}%)"
-                )
-                logging.info(
-                    f"  Class acc (routed)  : {entry['selected_cls_acc']:.2f}%"
-                )
-                logging.info(
-                    f"  Class acc (oracle)  : {entry['oracle_cls_acc']:.2f}%"
-                )
-                logging.info(
-                    f"  Batch preview       : {self._format_batch_preview(entry['selected_modules'])}"
-                )
-                logging.info(
-                    f"  Wrong batch ids     : {', '.join(entry['wrong_batches']) if entry['wrong_batches'] else 'none'}"
-                )
-            logging.info("=" * 70)
-
-        return report
 
     def after_task(self):
         self._network.backbone.reset_tosca()
