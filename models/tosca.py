@@ -22,10 +22,6 @@ class Learner(BaseLearner):
 
         # Task boundaries: task_ranges[i] = (start_class, end_class)
         self._task_ranges = []
-        # Task-specific test loaders for head-selection reports
-        self._task_test_loaders = []
-        # Selection history per task
-        self._tosca_selection_history = []
 
         # Routing strategy: "entropy" (baseline) or "gate"
         self._routing_mode = args.get(
@@ -69,16 +65,6 @@ class Learner(BaseLearner):
         self.test_loader = DataLoader(
             test_dataset, batch_size=48, shuffle=False, num_workers=num_workers
         )
-
-        task_test_dataset = data_manager.get_dataset(
-            np.arange(self._known_classes, self._total_classes),
-            source="test",
-            mode="test",
-        )
-        task_test_loader = DataLoader(
-            task_test_dataset, batch_size=48, shuffle=False, num_workers=num_workers
-        )
-        self._task_test_loaders.append(task_test_loader)
 
         train_dataset_for_protonet = data_manager.get_dataset(
             np.arange(self._known_classes, self._total_classes),
@@ -128,55 +114,24 @@ class Learner(BaseLearner):
                 scheduler.step()
             train_acc = np.around(tensor2numpy(correct) * 100 / total, decimals=2)
 
-            if epoch % 5 == 0:
-                test_acc = self._compute_accuracy(self._network, self.test_loader)
-                info = "Task {}, Epoch {}/{} => Loss {:.3f}, Train_accy {:.2f}, Test_accy {:.2f}".format(
-                    self._cur_task,
-                    epoch + 1,
-                    self.args["epochs"],
-                    losses / len(self.train_loader),
-                    train_acc,
-                    test_acc,
-                )
-            else:
-                info = "Task {}, Epoch {}/{} => Loss {:.3f}, Train_accy {:.2f}".format(
-                    self._cur_task,
-                    epoch + 1,
-                    self.args["epochs"],
-                    losses / len(self.train_loader),
-                    train_acc,
-                )
+            current_epoch = epoch + 1
+            test_acc = self._compute_accuracy(self._network, self.test_loader)
+            info = "Task {}, Epoch {}/{} [TEST CHECKPOINT] => Loss {:.3f}, Train_accy {:.2f}, Test_accy {:.2f}".format(
+                self._cur_task,
+                current_epoch,
+                self.args["epochs"],
+                losses / len(self.train_loader),
+                train_acc,
+                test_acc,
+            )
             prog_bar.set_description(info)
 
         logging.info(info)
         self._save_tosca()
 
-        report_batches = self.args.get("selection_report_batches", 20)
-
-        # Baseline analysis with entropy routing
-        entropy_report = self._report_tosca_module_selection(
-            max_batches_per_task=report_batches,
-            verbose=True,
-            selector="entropy",
-        )
-
-        gate_report = None
         if self._use_gate:
             self._collect_current_task_statistics()
             self._train_gate()
-            gate_report = self._report_tosca_module_selection(
-                max_batches_per_task=report_batches,
-                verbose=True,
-                selector="gate",
-            )
-
-        self._tosca_selection_history.append(
-            {
-                "task": self._cur_task,
-                "entropy": entropy_report,
-                "gate": gate_report,
-            }
-        )
 
         self.replace_fc()
 
@@ -210,12 +165,6 @@ class Learner(BaseLearner):
 
         class_stats = collector.compute_mean_variance()
         self._task_feature_stats[self._cur_task] = class_stats
-
-        logging.info(
-            "Collected gate feature statistics for Task %d (%d classes).",
-            self._cur_task,
-            len(class_stats),
-        )
 
     def _collect_all_synthetic_features(self):
         synthetic_per_class = int(self.args.get("gate_synthetic_per_class", 200))
@@ -304,15 +253,6 @@ class Learner(BaseLearner):
                 correct += (preds == task_ids).sum().item()
                 total += task_ids.size(0)
 
-            acc = 100.0 * correct / max(total, 1)
-            logging.info(
-                "Gate Task %d, Epoch %d/%d => Loss %.4f, TaskSelAcc %.2f",
-                self._cur_task,
-                epoch + 1,
-                gate_epochs,
-                epoch_loss / max(len(gate_loader), 1),
-                acc,
-            )
 
         self._gate.eval()
         self._save_gate()
@@ -369,122 +309,6 @@ class Learner(BaseLearner):
         task_idx = self._get_selected_task_for_batch(inputs, selector=selector)
         self._load_tosca(task_idx)
         return self._network(inputs)["logits"]
-
-    def _report_tosca_module_selection(
-        self, max_batches_per_task=20, verbose=False, selector="entropy"
-    ):
-        """
-        Report expected vs selected task head for each batch in each true task.
-        Also reports classification accuracy with selected head and true (oracle) head.
-        """
-        self._network.eval()
-        selector = selector.lower()
-        num_tasks = self._cur_task + 1
-        report = {}
-
-        with torch.no_grad():
-            for true_task in range(num_tasks):
-                loader = self._task_test_loaders[true_task]
-                selected_modules = []
-                selected_cls_correct = 0
-                oracle_cls_correct = 0
-                total_samples = 0
-
-                for batch_idx, (_, inputs, targets) in enumerate(loader):
-                    if batch_idx >= max_batches_per_task:
-                        break
-
-                    inputs = inputs.to(self._device)
-                    targets = targets.long().to(self._device)
-
-                    selected_task = self._get_selected_task_for_batch(
-                        inputs, selector=selector
-                    )
-                    selected_modules.append(selected_task)
-
-                    self._load_tosca(selected_task)
-                    selected_logits = self._network(inputs)["logits"]
-                    selected_preds = torch.argmax(selected_logits, dim=1)
-                    selected_cls_correct += (selected_preds == targets).sum().item()
-
-                    self._load_tosca(true_task)
-                    oracle_logits = self._network(inputs)["logits"]
-                    oracle_preds = torch.argmax(oracle_logits, dim=1)
-                    oracle_cls_correct += (oracle_preds == targets).sum().item()
-
-                    total_samples += targets.size(0)
-
-                num_batches = len(selected_modules)
-                wrong_batches = [
-                    f"B{idx + 1:02d}->T{sel}"
-                    for idx, sel in enumerate(selected_modules)
-                    if sel != true_task
-                ]
-                num_correct = num_batches - len(wrong_batches)
-
-                task_match_acc = (
-                    100.0 * num_correct / num_batches if num_batches > 0 else 0.0
-                )
-                selected_cls_acc = (
-                    100.0 * selected_cls_correct / total_samples
-                    if total_samples > 0
-                    else 0.0
-                )
-                oracle_cls_acc = (
-                    100.0 * oracle_cls_correct / total_samples
-                    if total_samples > 0
-                    else 0.0
-                )
-
-                report[true_task] = {
-                    "expected_task": true_task,
-                    "num_batches": num_batches,
-                    "selected_modules": selected_modules,
-                    "wrong_batches": wrong_batches,
-                    "num_correct": num_correct,
-                    "task_match_acc": task_match_acc,
-                    "selected_cls_acc": selected_cls_acc,
-                    "oracle_cls_acc": oracle_cls_acc,
-                }
-
-        if verbose:
-            logging.info("=" * 70)
-            logging.info(
-                f"TOSCA HEAD CHECK REPORT ({selector.upper()}) after Task {self._cur_task}"
-            )
-            logging.info(
-                f"Showing first {max_batches_per_task} test batches for each true task."
-            )
-            for true_task in range(num_tasks):
-                start_cls, end_cls = self._task_ranges[true_task]
-                entry = report[true_task]
-                selected_line = " ".join(
-                    [
-                        f"B{idx + 1:02d}:T{mod}"
-                        for idx, mod in enumerate(entry["selected_modules"])
-                    ]
-                )
-                logging.info(
-                    f"[True Task {true_task}] classes {start_cls}-{end_cls - 1} | expected head: T{true_task}"
-                )
-                logging.info(
-                    f"  Selected heads      : {selected_line if selected_line else 'no batches'}"
-                )
-                logging.info(
-                    f"  Wrong batches       : {', '.join(entry['wrong_batches']) if entry['wrong_batches'] else 'none'}"
-                )
-                logging.info(
-                    f"  Task match          : {entry['num_correct']}/{entry['num_batches']} ({entry['task_match_acc']:.1f}%)"
-                )
-                logging.info(
-                    f"  Class acc (selected): {entry['selected_cls_acc']:.2f}%"
-                )
-                logging.info(
-                    f"  Class acc (oracle)  : {entry['oracle_cls_acc']:.2f}%"
-                )
-            logging.info("=" * 70)
-
-        return report
 
     def after_task(self):
         self._network.backbone.reset_tosca()
@@ -556,11 +380,10 @@ class Learner(BaseLearner):
             )
         return scheduler
 
-    def _eval_cnn(self, loader):
+    def _eval_cnn_for_selector(self, loader, selector):
         self._network.eval()
         y_pred, y_true = [], []
 
-        selector = self._routing_mode if self._use_gate else "entropy"
         for _, (_, inputs, targets) in enumerate(loader):
             inputs, targets = inputs.to(self._device), targets.long().to(self._device)
             with torch.no_grad():
@@ -572,6 +395,21 @@ class Learner(BaseLearner):
             y_true.append(targets.cpu().numpy())
 
         return np.concatenate(y_pred), np.concatenate(y_true)
+
+    def eval_routing_comparison(self):
+        if not self._use_gate:
+            return None
+
+        comparisons = {}
+        for selector in ("entropy", "gate"):
+            y_pred, y_true = self._eval_cnn_for_selector(self.test_loader, selector)
+            comparisons[selector] = self._evaluate(y_pred, y_true)
+
+        return comparisons
+
+    def _eval_cnn(self, loader):
+        selector = self._routing_mode if self._use_gate else "entropy"
+        return self._eval_cnn_for_selector(loader, selector)
 
     def _save_tosca(self):
         path = f"tosca/task{self._cur_task}.pth"

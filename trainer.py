@@ -73,10 +73,34 @@ def _train(args):
         )
         model.incremental_train(data_manager)
         cnn_accy, nme_accy = model.eval_task()
+        routing_comparison = (
+            model.eval_routing_comparison()
+            if hasattr(model, "eval_routing_comparison")
+            else None
+        )
         model.after_task()
 
         if nme_accy is not None:
             logging.info("CNN: {}".format(cnn_accy["grouped"]))
+            if routing_comparison is not None:
+                logging.info(
+                    "CNN (ENTROPY ROUTING): {}".format(
+                        routing_comparison["entropy"]["grouped"]
+                    )
+                )
+                logging.info(
+                    "CNN (GATE ROUTING): {}".format(
+                        routing_comparison["gate"]["grouped"]
+                    )
+                )
+                entropy_top1 = routing_comparison["entropy"]["top1"]
+                gate_top1 = routing_comparison["gate"]["top1"]
+                logging.info("=" * 70)
+                logging.info("FINAL CNN COMPARISON after Task {}".format(task))
+                logging.info("Entropy routing top1: {:.2f}".format(entropy_top1))
+                logging.info("Gate routing top1   : {:.2f}".format(gate_top1))
+                logging.info("Delta (gate-entropy): {:+.2f}".format(gate_top1 - entropy_top1))
+                logging.info("=" * 70)
             logging.info("NME: {}".format(nme_accy["grouped"]))
 
             cnn_keys = [key for key in cnn_accy["grouped"].keys() if '-' in key]    
@@ -106,6 +130,25 @@ def _train(args):
         else:
             logging.info("No NME accuracy.")
             logging.info("CNN: {}".format(cnn_accy["grouped"]))
+            if routing_comparison is not None:
+                logging.info(
+                    "CNN (ENTROPY ROUTING): {}".format(
+                        routing_comparison["entropy"]["grouped"]
+                    )
+                )
+                logging.info(
+                    "CNN (GATE ROUTING): {}".format(
+                        routing_comparison["gate"]["grouped"]
+                    )
+                )
+                entropy_top1 = routing_comparison["entropy"]["top1"]
+                gate_top1 = routing_comparison["gate"]["top1"]
+                logging.info("=" * 70)
+                logging.info("FINAL CNN COMPARISON after Task {}".format(task))
+                logging.info("Entropy routing top1: {:.2f}".format(entropy_top1))
+                logging.info("Gate routing top1   : {:.2f}".format(gate_top1))
+                logging.info("Delta (gate-entropy): {:+.2f}".format(gate_top1 - entropy_top1))
+                logging.info("=" * 70)
 
             cnn_keys = [key for key in cnn_accy["grouped"].keys() if '-' in key]
             cnn_values = [cnn_accy["grouped"][key] for key in cnn_keys]
