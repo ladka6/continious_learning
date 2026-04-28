@@ -69,8 +69,6 @@ class Learner(BaseLearner):
         else:
             self._set_trainable(adapters=False, tosca=True, w_rand=False)
         
-        # self._init_prototypes()
-
         total = sum(p.numel() for p in self._network.parameters())
         trainable = sum(p.numel() for p in self._network.parameters() if p.requires_grad)
         logging.info(f"Task {self._cur_task}: {trainable:,}/{total:,} trainable")
@@ -274,6 +272,8 @@ class Learner(BaseLearner):
                     p.requires_grad = True
         if tosca:
             for p in self._network.backbone.tosca.parameters():
+                p.requires_grad = True
+            for p in self._network.fc.parameters():
                 p.requires_grad = True
         if w_rand:
             self._network.backbone.W_rand.requires_grad = True
