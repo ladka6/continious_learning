@@ -9,7 +9,7 @@ from torch.utils.data import DataLoader, TensorDataset
 from utils.gating import FeatureStatsCollector, TaskGate, generate_samples
 from utils.inc_net import SimpleVitNet
 from models.base import BaseLearner
-from utils.toolkit import target2onehot, tensor2numpy
+from utils.toolkit import tensor2numpy
 
 num_workers = 10
 
@@ -20,109 +20,31 @@ class Learner(BaseLearner):
         self._network = SimpleVitNet(args, True)
         self.args = args
 
+        # Task boundaries: task_ranges[i] = (start_class, end_class)
         self._task_ranges = []
 
+        # Routing strategy: "entropy" (baseline) or "gate"
         self._routing_mode = args.get(
             "routing_mode", args.get("task_selector", "entropy")
         ).lower()
         self._use_gate = self._routing_mode == "gate"
 
+        # Gate components
         self._gate = None
         self._task_feature_stats = {}
-
-        # RanPAC state
-        self._total_classnum = None   
-        self.W_rand = None            
-        self.G = None                 
-        self.Q = None                 
-        self._ranpac_Wo = None        
-
-    # ─────────────────────────────────────────────────────────────
-    # RanPAC
-    # ─────────────────────────────────────────────────────────────
-
-    def setup_RP(self):
-        """
-        Called once after task 0 training completes.
-        W_rand is sampled from N(0,1) and never updated again.
-        G and Q live on CPU to avoid 400MB GPU allocation for M=10000.
-        """
-        M = self.args.get("ranpac_M", 10000)
-        L = self._network.feature_dim 
-        K = self._total_classnum
-
-        self.W_rand = torch.randn(L, M)  
-        self.G = torch.zeros(M, M)       
-        self.Q = torch.zeros(M, K)       
-
-        logging.info(f"RanPAC: W_rand ({L}×{M}), G ({M}×{M}), Q ({M}×{K}) initialised.")
-
-    def optimise_ridge_parameter(self, Features, Y):
-        ridges = 10.0 ** np.arange(-8, 9)
-        num_val = int(Features.shape[0] * 0.8)
-        losses = []
-        Q_val = Features[:num_val].T @ Y[:num_val]
-        G_val = Features[:num_val].T @ Features[:num_val]
-        for ridge in ridges:
-            Wo = torch.linalg.solve(
-                G_val + ridge * torch.eye(G_val.size(0)), Q_val
-            ).T
-            losses.append(F.mse_loss(Features[num_val:] @ Wo.T, Y[num_val:]).item())
-        best = ridges[np.argmin(losses)]
-        logging.info(f"RanPAC optimal λ = {best}")
-        return best
-
-    def replace_fc(self):
-        self._network.eval()
-        self._load_tosca(self._cur_task)
-
-        embedding_list = []
-        label_list = []
-        with torch.no_grad():
-            for _, data, label in self.train_loader_for_protonet:
-                data = data.to(self._device)
-                label = label.long().to(self._device)
-                embedding = self._network.backbone(data)
-                embedding_list.append(embedding.cpu())
-                label_list.append(label.cpu())
-
-        Features_f = torch.cat(embedding_list, dim=0)
-        label_list = torch.cat(label_list, dim=0)     
-
-        Y = target2onehot(label_list, self._total_classnum)
-
-        Features_h = F.relu(Features_f @ self.W_rand)
-
-        self.G = self.G + Features_h.T @ Features_h  
-        self.Q = self.Q + Features_h.T @ Y           
-
-        # solve: Wₒ = (G + λI)⁻¹ Q  →  shape (M, K)
-        ridge = self.optimise_ridge_parameter(Features_h, Y)
-        self._ranpac_Wo = torch.linalg.solve(
-            self.G + ridge * torch.eye(self.G.size(0)),
-            self.Q
-        ).to(self._device)  # (M, K) on device for fast inference
-
-        logging.info(f"RanPAC: Wₒ updated → shape {self._ranpac_Wo.shape}")
-
-    # ─────────────────────────────────────────────────────────────
-    # Training
-    # ─────────────────────────────────────────────────────────────
 
     def incremental_train(self, data_manager):
         self._cur_task += 1
         self._total_classes = self._known_classes + data_manager.get_task_size(
             self._cur_task
         )
-        # total_classnum is fixed for the whole experiment — grab it once
-        if self._total_classnum is None:
-            self._total_classnum = data_manager.get_total_classnum()
-            logging.info(f"Total classes in experiment: {self._total_classnum}")
-
         self._network.update_fc(self._total_classes)
 
+        # Record task boundary
         self._task_ranges.append((self._known_classes, self._total_classes))
-        logging.info("Learning on {}-{}".format(self._known_classes, self._total_classes))
+        logging.info(
+            "Learning on {}-{}".format(self._known_classes, self._total_classes)
+        )
         logging.info(f"Task ranges so far: {self._task_ranges}")
 
         self.train_dataset = data_manager.get_dataset(
@@ -172,6 +94,7 @@ class Learner(BaseLearner):
                 inputs, targets = inputs.to(self._device), targets.long().to(
                     self._device
                 )
+
                 optimizer.zero_grad()
                 logits = self._network(inputs)["logits"]
                 loss = F.cross_entropy(logits, targets)
@@ -190,9 +113,10 @@ class Learner(BaseLearner):
             if scheduler is not None:
                 scheduler.step()
             train_acc = np.around(tensor2numpy(correct) * 100 / total, decimals=2)
+
             current_epoch = epoch + 1
             test_acc = self._compute_accuracy(self._network, self.test_loader)
-            info = "Task {}, Epoch {}/{} => Loss {:.3f}, Train_accy {:.2f}, Test_accy {:.2f}".format(
+            info = "Task {}, Epoch {}/{} [TEST CHECKPOINT] => Loss {:.3f}, Train_accy {:.2f}, Test_accy {:.2f}".format(
                 self._cur_task,
                 current_epoch,
                 self.args["epochs"],
@@ -209,37 +133,7 @@ class Learner(BaseLearner):
             self._collect_current_task_statistics()
             self._train_gate()
 
-        # RanPAC: init on task 0, accumulate + solve every task
-        if self._cur_task == 0:
-            self.setup_RP()
         self.replace_fc()
-
-    # ─────────────────────────────────────────────────────────────
-    # Inference
-    # ─────────────────────────────────────────────────────────────
-
-    def get_routed_logits(self, inputs, selector=None):
-        """
-        Gate selects which TOSCA checkpoint to load, then RanPAC scores the batch.
-        Falls back to FC logits only if replace_fc hasn't run yet (should never
-        happen outside the first epoch of task 0).
-        """
-        task_idx = self._get_selected_task_for_batch(inputs, selector=selector)
-        self._load_tosca(task_idx)
-
-        if self._ranpac_Wo is None:
-            # safety fallback — FC path
-            return self._network(inputs)["logits"]
-
-        with torch.no_grad():
-            f = self._network.backbone(inputs)   # (N, L) post-TOSCA
-            h = F.relu(f @ self.W_rand.to(self._device))  # (N, M)
-            scores = h @ self._ranpac_Wo          # (N, K)
-        return scores
-
-    # ─────────────────────────────────────────────────────────────
-    # Gate
-    # ─────────────────────────────────────────────────────────────
 
     def _get_backbone(self):
         if isinstance(self._network, torch.nn.DataParallel):
@@ -261,6 +155,7 @@ class Learner(BaseLearner):
             feature_dim=self._network.feature_dim,
             min_variance=self.args.get("gate_min_variance", 1e-6),
         )
+
         with torch.no_grad():
             for _, data, label in self.train_loader_for_protonet:
                 data = data.to(self._device)
@@ -268,7 +163,8 @@ class Learner(BaseLearner):
                 features = self._prepare_gate_features(features)
                 collector.update(features, label)
 
-        self._task_feature_stats[self._cur_task] = collector.compute_mean_variance()
+        class_stats = collector.compute_mean_variance()
+        self._task_feature_stats[self._cur_task] = class_stats
 
     def _collect_all_synthetic_features(self):
         synthetic_per_class = int(self.args.get("gate_synthetic_per_class", 200))
@@ -315,6 +211,7 @@ class Learner(BaseLearner):
         self._init_or_extend_gate()
 
         train_x, train_y = self._collect_all_synthetic_features()
+
         if train_x.numel() == 0:
             logging.warning("No synthetic features available for gate training.")
             return
@@ -332,9 +229,7 @@ class Learner(BaseLearner):
             num_workers=0,
         )
 
-        optimizer = optim.Adam(
-            self._gate.parameters(), lr=gate_lr, weight_decay=gate_wd
-        )
+        optimizer = optim.Adam(self._gate.parameters(), lr=gate_lr, weight_decay=gate_wd)
         criterion = torch.nn.CrossEntropyLoss()
 
         self._gate.train()
@@ -342,18 +237,22 @@ class Learner(BaseLearner):
             epoch_loss = 0.0
             correct = 0
             total = 0
+
             for features, task_ids in gate_loader:
                 features = features.to(self._device)
                 task_ids = task_ids.to(self._device)
+
                 optimizer.zero_grad()
                 logits = self._gate(features)
                 loss = criterion(logits, task_ids)
                 loss.backward()
                 optimizer.step()
+
                 epoch_loss += loss.item()
                 preds = torch.argmax(logits, dim=1)
                 correct += (preds == task_ids).sum().item()
                 total += task_ids.size(0)
+
 
         self._gate.eval()
         self._save_gate()
@@ -361,6 +260,7 @@ class Learner(BaseLearner):
     def _save_gate(self):
         if self._gate is None:
             return
+
         path = f"tosca/gate_task{self._cur_task}.pth"
         torch.save(
             {
@@ -383,11 +283,13 @@ class Learner(BaseLearner):
                 probabilities * torch.log(probabilities + 1e-9), dim=1
             )
             entropies.append(torch.mean(batch_entropy).item())
+
         return int(np.argmin(entropies))
 
     def _get_selected_task_for_batch_gate(self, inputs):
         if self._gate is None or self._gate.num_tasks < (self._cur_task + 1):
             return self._get_selected_task_for_batch_entropy(inputs)
+
         self._gate.eval()
         features = self._extract_backbone_features(inputs)
         features = self._prepare_gate_features(features)
@@ -397,40 +299,113 @@ class Learner(BaseLearner):
 
     def _get_selected_task_for_batch(self, inputs, selector=None):
         selector = (selector or self._routing_mode).lower()
+
         if selector == "gate":
             return self._get_selected_task_for_batch_gate(inputs)
+
         return self._get_selected_task_for_batch_entropy(inputs)
 
-    # ─────────────────────────────────────────────────────────────
-    # Bookkeeping
-    # ─────────────────────────────────────────────────────────────
+    def get_routed_logits(self, inputs, selector=None):
+        task_idx = self._get_selected_task_for_batch(inputs, selector=selector)
+        self._load_tosca(task_idx)
+        return self._network(inputs)["logits"]
 
     def after_task(self):
         self._network.backbone.reset_tosca()
         self._known_classes = self._total_classes
 
-    def eval_routing_comparison(self):
-        if not self._use_gate:
-            return None
-        comparisons = {}
-        for selector in ("entropy", "gate"):
-            y_pred, y_true = self._eval_cnn_for_selector(self.test_loader, selector)
-            comparisons[selector] = self._evaluate(y_pred, y_true)
-        return comparisons
+    def replace_fc(self):
+        self._network.eval()
+        self._load_tosca(self._cur_task)
+        embedding_list = []
+        label_list = []
+        with torch.no_grad():
+            for _, data, label in self.train_loader_for_protonet:
+                data = data.to(self._device)
+                label = label.long().to(self._device)
+                embedding = self._network.backbone(data)
+                embedding_list.append(embedding.cpu())
+                label_list.append(label.cpu())
+        embedding_list = torch.cat(embedding_list, dim=0)
+        label_list = torch.cat(label_list, dim=0)
+
+        class_list = np.unique(self.train_dataset.labels)
+        for class_index in class_list:
+            data_index = (label_list == class_index).nonzero().squeeze(-1)
+            embedding = embedding_list[data_index]
+            proto = embedding.mean(0)
+            self._network.fc.weight.data[class_index] = proto
+
+    def get_optimizer(self, lr):
+        if self.args["optimizer"] == "sgd":
+            optimizer = optim.SGD(
+                filter(lambda p: p.requires_grad, self._network.parameters()),
+                momentum=0.9,
+                lr=lr,
+                weight_decay=self.args["weight_decay"],
+            )
+        elif self.args["optimizer"] == "adam":
+            optimizer = optim.Adam(
+                filter(lambda p: p.requires_grad, self._network.parameters()),
+                lr=lr,
+                weight_decay=self.args["weight_decay"],
+            )
+        elif self.args["optimizer"] == "adamw":
+            optimizer = optim.AdamW(
+                filter(lambda p: p.requires_grad, self._network.parameters()),
+                lr=lr,
+                weight_decay=self.args["weight_decay"],
+            )
+        else:
+            raise NotImplementedError(
+                "Unknown optimizer {}".format(self.args["optimizer"])
+            )
+        return optimizer
+
+    def get_scheduler(self, optimizer, epoch):
+        if self.args["scheduler"] == "constant":
+            scheduler = None
+        elif self.args["scheduler"] == "cosine":
+            scheduler = optim.lr_scheduler.CosineAnnealingLR(
+                optimizer=optimizer, T_max=epoch, eta_min=1e-8
+            )
+        elif self.args["scheduler"] == "steplr":
+            scheduler = optim.lr_scheduler.MultiStepLR(
+                optimizer=optimizer,
+                milestones=self.args["milestones"],
+            )
+        else:
+            raise NotImplementedError(
+                "Unknown scheduler {}".format(self.args["scheduler"])
+            )
+        return scheduler
 
     def _eval_cnn_for_selector(self, loader, selector):
         self._network.eval()
         y_pred, y_true = [], []
+
         for _, (_, inputs, targets) in enumerate(loader):
             inputs, targets = inputs.to(self._device), targets.long().to(self._device)
             with torch.no_grad():
                 outputs = self.get_routed_logits(inputs, selector=selector)
-            predicts = torch.topk(
-                outputs, k=self.topk, dim=1, largest=True, sorted=True
-            )[1]
+            predicts = torch.topk(outputs, k=self.topk, dim=1, largest=True, sorted=True)[
+                1
+            ]
             y_pred.append(predicts.cpu().numpy())
             y_true.append(targets.cpu().numpy())
+
         return np.concatenate(y_pred), np.concatenate(y_true)
+
+    def eval_routing_comparison(self):
+        if not self._use_gate:
+            return None
+
+        comparisons = {}
+        for selector in ("entropy", "gate"):
+            y_pred, y_true = self._eval_cnn_for_selector(self.test_loader, selector)
+            comparisons[selector] = self._evaluate(y_pred, y_true)
+
+        return comparisons
 
     def _eval_cnn(self, loader):
         selector = self._routing_mode if self._use_gate else "entropy"
@@ -452,39 +427,3 @@ class Learner(BaseLearner):
         current_state_dict = self._network.state_dict()
         current_state_dict.update(tosca_state_dict)
         self._network.load_state_dict(current_state_dict)
-
-    def get_optimizer(self, lr):
-        if self.args["optimizer"] == "sgd":
-            return optim.SGD(
-                filter(lambda p: p.requires_grad, self._network.parameters()),
-                momentum=0.9,
-                lr=lr,
-                weight_decay=self.args["weight_decay"],
-            )
-        elif self.args["optimizer"] == "adam":
-            return optim.Adam(
-                filter(lambda p: p.requires_grad, self._network.parameters()),
-                lr=lr,
-                weight_decay=self.args["weight_decay"],
-            )
-        elif self.args["optimizer"] == "adamw":
-            return optim.AdamW(
-                filter(lambda p: p.requires_grad, self._network.parameters()),
-                lr=lr,
-                weight_decay=self.args["weight_decay"],
-            )
-        raise NotImplementedError("Unknown optimizer {}".format(self.args["optimizer"]))
-
-    def get_scheduler(self, optimizer, epoch):
-        if self.args["scheduler"] == "constant":
-            return None
-        elif self.args["scheduler"] == "cosine":
-            return optim.lr_scheduler.CosineAnnealingLR(
-                optimizer=optimizer, T_max=epoch, eta_min=1e-8
-            )
-        elif self.args["scheduler"] == "steplr":
-            return optim.lr_scheduler.MultiStepLR(
-                optimizer=optimizer,
-                milestones=self.args["milestones"],
-            )
-        raise NotImplementedError("Unknown scheduler {}".format(self.args["scheduler"]))

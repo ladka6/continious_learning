@@ -64,7 +64,6 @@ def _train(args):
     model = factory.get_model(args["model_name"], args)
 
     cnn_curve, nme_curve = {"top1": [], "top5": []}, {"top1": [], "top5": []}
-    entropy_curve, gate_curve = {"top1": []}, {"top1": []}
     cnn_matrix, nme_matrix = [], []
 
     for task in range(data_manager.nb_tasks):
@@ -96,15 +95,11 @@ def _train(args):
                 )
                 entropy_top1 = routing_comparison["entropy"]["top1"]
                 gate_top1 = routing_comparison["gate"]["top1"]
-                entropy_curve["top1"].append(entropy_top1)
-                gate_curve["top1"].append(gate_top1)
                 logging.info("=" * 70)
                 logging.info("FINAL CNN COMPARISON after Task {}".format(task))
                 logging.info("Entropy routing top1: {:.2f}".format(entropy_top1))
                 logging.info("Gate routing top1   : {:.2f}".format(gate_top1))
                 logging.info("Delta (gate-entropy): {:+.2f}".format(gate_top1 - entropy_top1))
-                logging.info("Entropy top1 curve: {}".format(entropy_curve["top1"]))
-                logging.info("Gate    top1 curve: {}".format(gate_curve["top1"]))
                 logging.info("=" * 70)
             logging.info("NME: {}".format(nme_accy["grouped"]))
 
@@ -148,15 +143,11 @@ def _train(args):
                 )
                 entropy_top1 = routing_comparison["entropy"]["top1"]
                 gate_top1 = routing_comparison["gate"]["top1"]
-                entropy_curve["top1"].append(entropy_top1)
-                gate_curve["top1"].append(gate_top1)
                 logging.info("=" * 70)
                 logging.info("FINAL CNN COMPARISON after Task {}".format(task))
                 logging.info("Entropy routing top1: {:.2f}".format(entropy_top1))
-                logging.info("Gate    routing top1: {:.2f}".format(gate_top1))
+                logging.info("Gate routing top1   : {:.2f}".format(gate_top1))
                 logging.info("Delta (gate-entropy): {:+.2f}".format(gate_top1 - entropy_top1))
-                logging.info("Entropy top1 curve: {}".format(entropy_curve["top1"]))
-                logging.info("Gate    top1 curve: {}".format(gate_curve["top1"]))
                 logging.info("=" * 70)
 
             cnn_keys = [key for key in cnn_accy["grouped"].keys() if '-' in key]
