@@ -89,9 +89,7 @@ class Learner(BaseLearner):
                 optimizer.zero_grad()
                 logits = self._network(inputs)["logits"]
                 ce = F.cross_entropy(logits, targets)
-                print("CE loss:", ce.item())
                 l1 = sum(p.abs().sum() for p in self._network.backbone.tosca.parameters())
-                print("L1 loss:", l1)
                 loss = ce + self.args["l1"] * l1
                 loss.backward()
                 optimizer.step()
