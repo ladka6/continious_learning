@@ -6,7 +6,7 @@ from torch import optim
 from torch.nn import functional as F
 from torch.utils.data import DataLoader, TensorDataset
 
-from utils.gating import FeatureStatsCollector, TaskGate, generate_samples
+from utils.gating import FeatureStatsCollector, TaskGateWithRandomProjection, generate_samples
 from utils.inc_net import SimpleVitNet
 from models.base import BaseLearner
 from utils.toolkit import tensor2numpy
@@ -198,10 +198,11 @@ class Learner(BaseLearner):
     def _init_or_extend_gate(self):
         num_tasks = self._cur_task + 1
         if self._gate is None:
-            self._gate = TaskGate(
+            self._gate = TaskGateWithRandomProjection(
                 input_dim=self._network.feature_dim,
                 num_tasks=num_tasks,
                 hidden_dim=int(self.args.get("gate_hidden_dim", 0)),
+                projection_dim=int(self.args.get("gate_projection_dim", 10000)),
             ).to(self._device)
         else:
             self._gate.extend(num_tasks)
@@ -273,42 +274,50 @@ class Learner(BaseLearner):
         )
         logging.info(f"Gate parameters saved to {path}.")
 
-    def _get_selected_task_for_batch_entropy(self, inputs):
-        entropies = []
+    def _get_lowentropy_logits(self, inputs):
+        all_logits = []
+        all_entropies = []
         for task_idx in range(self._cur_task + 1):
             self._load_tosca(task_idx)
             outputs = self._network(inputs)["logits"]
-            probabilities = F.softmax(outputs, dim=1)
-            batch_entropy = -torch.sum(
-                probabilities * torch.log(probabilities + 1e-9), dim=1
-            )
-            entropies.append(torch.mean(batch_entropy).item())
+            all_logits.append(outputs)
+            probs = F.softmax(outputs, dim=1)
+            ent = -torch.sum(probs * torch.log(probs + 1e-9), dim=1)
+            all_entropies.append(ent)
 
-        return int(np.argmin(entropies))
+        entropies = torch.stack(all_entropies, dim=0)
+        logits = torch.stack(all_logits, dim=0)
 
-    def _get_selected_task_for_batch_gate(self, inputs):
+        chosen_task = torch.argmin(entropies, dim=0)
+        batch_size = inputs.size(0)
+        return logits[chosen_task, torch.arange(batch_size, device=inputs.device)]
+
+    def _get_gate_routed_logits(self, inputs):
         if self._gate is None or self._gate.num_tasks < (self._cur_task + 1):
-            return self._get_selected_task_for_batch_entropy(inputs)
+            return self._get_lowentropy_logits(inputs)
 
         self._gate.eval()
         features = self._extract_backbone_features(inputs)
         features = self._prepare_gate_features(features)
-        logits = self._gate(features)
-        probs = F.softmax(logits, dim=1).mean(dim=0)
-        return int(torch.argmax(probs).item())
+        gate_logits = self._gate(features)
+        chosen_task = torch.argmax(gate_logits, dim=1)
 
-    def _get_selected_task_for_batch(self, inputs, selector=None):
-        selector = (selector or self._routing_mode).lower()
+        batch_size = inputs.size(0)
+        total_classes = self._network.fc.out_features
+        out_logits = torch.zeros(batch_size, total_classes, device=inputs.device)
 
-        if selector == "gate":
-            return self._get_selected_task_for_batch_gate(inputs)
+        for t in chosen_task.unique().tolist():
+            mask = chosen_task == t
+            self._load_tosca(int(t))
+            out_logits[mask] = self._network(inputs[mask])["logits"]
 
-        return self._get_selected_task_for_batch_entropy(inputs)
+        return out_logits
 
     def get_routed_logits(self, inputs, selector=None):
-        task_idx = self._get_selected_task_for_batch(inputs, selector=selector)
-        self._load_tosca(task_idx)
-        return self._network(inputs)["logits"]
+        selector = (selector or self._routing_mode).lower()
+        if selector == "gate":
+            return self._get_gate_routed_logits(inputs)
+        return self._get_lowentropy_logits(inputs)
 
     def after_task(self):
         self._network.backbone.reset_tosca()

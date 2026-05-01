@@ -9,6 +9,7 @@ class ToscaAdaptiveViT(nn.Module):
     ViT (with adapters) → W_rand projection → Tosca module.
     Tosca operates in the M-dim RP space, not the 768-dim feature space.
     """
+
     def __init__(self, model, mlp_ratio, se_ratio, flow, M=10000, embed_dim=768):
         super().__init__()
         self.vit = model
@@ -18,7 +19,7 @@ class ToscaAdaptiveViT(nn.Module):
         for p in self.vit.parameters():
             p.requires_grad = False
         for name, p in self.vit.named_parameters():
-            if 'adaptmlp' in name:
+            if "adaptmlp" in name:
                 p.requires_grad = True
 
         self.W_rand = nn.Parameter(torch.randn(embed_dim, M))
@@ -26,22 +27,21 @@ class ToscaAdaptiveViT(nn.Module):
         self.tosca = Tosca(M, mlp_ratio, se_ratio, flow)
 
     def forward_features(self, x):
-        return self.vit.forward_features(x)  # [B, 768], CLS token already pooled
+        return self.vit.forward_features(x)
 
     def forward(self, x):
-        x = self.forward_features(x)             # [B, 768]
-        x = torch.relu(x @ self.W_rand)          # [B, M]
-        x = self.tosca(x)                        # [B, M]
+        x = self.forward_features(x)
+        x = torch.relu(x @ self.W_rand)
+        x = self.tosca(x)
         return x
 
     def freeze_adapters(self):
         for name, p in self.vit.named_parameters():
-            if 'adaptmlp' in name:
+            if "adaptmlp" in name:
                 p.requires_grad = False
-    
+
     def freeze_w_rand(self):
         self.W_rand.requires_grad = False
-
 
     def reset_tosca(self):
         for m in self.tosca.modules():

@@ -115,3 +115,50 @@ class TaskGate(nn.Module):
     def forward(self, x):
         x = self.backbone(x)
         return self.classifier(x)
+
+class TaskGateWithRandomProjection(nn.Module):
+    def __init__(self, input_dim, num_tasks=1, hidden_dim=0, projection_dim=10000):
+        super().__init__()
+        self.hidden_dim = hidden_dim
+        self.projection_dim = projection_dim
+        self.random_projection = nn.Parameter(torch.randn(input_dim, self.projection_dim)).requires_grad_(False)
+        
+
+        if hidden_dim > 0:
+            self.backbone = nn.Sequential(
+                nn.Linear(projection_dim if projection_dim else input_dim, hidden_dim),
+                nn.ReLU(inplace=True),
+            )
+            classifier_in_dim = hidden_dim
+        else:
+            self.backbone = nn.Identity()
+            classifier_in_dim = projection_dim if projection_dim else input_dim
+
+        self.classifier = nn.Linear(classifier_in_dim, num_tasks)
+
+    @property
+    def num_tasks(self):
+        return self.classifier.out_features
+
+    def extend(self, num_tasks):
+        if num_tasks <= self.num_tasks:
+            return
+
+        old_classifier = self.classifier
+        new_classifier = nn.Linear(old_classifier.in_features, num_tasks)
+        new_classifier = new_classifier.to(old_classifier.weight.device)
+
+        with torch.no_grad():
+            new_classifier.weight[: old_classifier.out_features].copy_(
+                old_classifier.weight
+            )
+            new_classifier.bias[: old_classifier.out_features].copy_(
+                old_classifier.bias
+            )
+
+        self.classifier = new_classifier
+
+    def forward(self, x):
+        x = x @ self.random_projection
+        x = self.backbone(x)
+        return self.classifier(x)

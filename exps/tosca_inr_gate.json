@@ -1,9 +1,9 @@
 {
   "prefix": " ",
-  "dataset": "cifar224",
+  "dataset": "imagenetr",
   "shuffle": true,
-  "init_cls": 5,
-  "increment": 5,
+  "init_cls": 20,
+  "increment": 20,
   "model_name": "tosca",
   "backbone_type": "vit_base_patch16_224_in21k",
   "pretrained": true,

@@ -12,7 +12,7 @@ from models.base import BaseLearner
 from utils.toolkit import tensor2numpy
 from utils.gating import FeatureStatsCollector, TaskGate, generate_samples
 
-num_workers = 4
+num_workers = 10
 TOSCA_DIR = "tosca"
 
 
@@ -63,7 +63,6 @@ class Learner(BaseLearner):
     def _train(self):
         self._network.to(self._device)
 
-        # Trainable params: adapters (task 0 only) + tosca (always)
         if self._cur_task == 0:
             self._set_trainable(adapters=True, tosca=True, w_rand=True)
         else:
