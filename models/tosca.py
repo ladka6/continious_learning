@@ -23,12 +23,6 @@ class Learner(BaseLearner):
         # Task boundaries: task_ranges[i] = (start_class, end_class)
         self._task_ranges = []
 
-        # Routing strategy: "entropy" (baseline) or "gate"
-        self._routing_mode = args.get(
-            "routing_mode", args.get("task_selector", "entropy")
-        ).lower()
-        self._use_gate = self._routing_mode == "gate"
-
         # Gate components
         self._gate = None
         self._task_feature_stats = {}
@@ -126,9 +120,8 @@ class Learner(BaseLearner):
         logging.info(info)
         self._save_tosca()
 
-        if self._use_gate:
-            self._collect_current_task_statistics()
-            self._train_gate()
+        self._collect_current_task_statistics()
+        self._train_gate()
 
         self.replace_fc()
 
@@ -190,7 +183,9 @@ class Learner(BaseLearner):
                 torch.empty(0, dtype=torch.long),
             )
 
-        return torch.cat(all_features, dim=0), torch.cat(all_targets, dim=0)
+        features = torch.cat(all_features, dim=0)
+        features = self._prepare_gate_features(features)
+        return features, torch.cat(all_targets, dim=0)
 
     def _init_or_extend_gate(self):
         num_tasks = self._cur_task + 1
@@ -251,6 +246,12 @@ class Learner(BaseLearner):
                 correct += (preds == task_ids).sum().item()
                 total += task_ids.size(0)
 
+            avg_loss = epoch_loss / max(len(gate_loader), 1)
+            train_acc = 100.0 * correct / total if total > 0 else 0.0
+            logging.info(
+                f"Gate Task {self._cur_task}, Epoch {epoch + 1}/{gate_epochs} => "
+                f"Loss {avg_loss:.4f}, Train_accy {train_acc:.2f}"
+            )
 
         self._gate.eval()
         self._save_gate()
@@ -271,27 +272,11 @@ class Learner(BaseLearner):
         )
         logging.info(f"Gate parameters saved to {path}.")
 
-    def _get_lowentropy_logits(self, inputs):
-        all_logits = []
-        all_entropies = []
-        for task_idx in range(self._cur_task + 1):
-            self._load_tosca(task_idx)
-            outputs = self._network(inputs)["logits"]
-            all_logits.append(outputs)
-            probs = F.softmax(outputs, dim=1)
-            ent = -torch.sum(probs * torch.log(probs + 1e-9), dim=1)
-            all_entropies.append(ent)
-
-        entropies = torch.stack(all_entropies, dim=0)
-        logits = torch.stack(all_logits, dim=0)
-
-        chosen_task = torch.argmin(entropies, dim=0)
-        batch_size = inputs.size(0)
-        return logits[chosen_task, torch.arange(batch_size, device=inputs.device)]
-
     def _get_gate_routed_logits(self, inputs):
         if self._gate is None or self._gate.num_tasks < (self._cur_task + 1):
-            return self._get_lowentropy_logits(inputs)
+            raise RuntimeError(
+                "Gate is not initialized or out of sync with current task count."
+            )
 
         self._gate.eval()
         features = self._extract_backbone_features(inputs)
@@ -309,12 +294,6 @@ class Learner(BaseLearner):
             out_logits[mask] = self._network(inputs[mask])["logits"]
 
         return out_logits
-
-    def get_routed_logits(self, inputs, selector=None):
-        selector = (selector or self._routing_mode).lower()
-        if selector == "gate":
-            return self._get_gate_routed_logits(inputs)
-        return self._get_lowentropy_logits(inputs)
 
     def after_task(self):
         self._network.backbone.reset_tosca()
@@ -386,14 +365,14 @@ class Learner(BaseLearner):
             )
         return scheduler
 
-    def _eval_cnn_for_selector(self, loader, selector):
+    def _eval_cnn(self, loader):
         self._network.eval()
         y_pred, y_true = [], []
 
         for _, (_, inputs, targets) in enumerate(loader):
             inputs, targets = inputs.to(self._device), targets.long().to(self._device)
             with torch.no_grad():
-                outputs = self.get_routed_logits(inputs, selector=selector)
+                outputs = self._get_gate_routed_logits(inputs)
             predicts = torch.topk(outputs, k=self.topk, dim=1, largest=True, sorted=True)[
                 1
             ]
@@ -401,21 +380,6 @@ class Learner(BaseLearner):
             y_true.append(targets.cpu().numpy())
 
         return np.concatenate(y_pred), np.concatenate(y_true)
-
-    def eval_routing_comparison(self):
-        if not self._use_gate:
-            return None
-
-        comparisons = {}
-        for selector in ("entropy", "gate"):
-            y_pred, y_true = self._eval_cnn_for_selector(self.test_loader, selector)
-            comparisons[selector] = self._evaluate(y_pred, y_true)
-
-        return comparisons
-
-    def _eval_cnn(self, loader):
-        selector = self._routing_mode if self._use_gate else "entropy"
-        return self._eval_cnn_for_selector(loader, selector)
 
     def _save_tosca(self):
         path = f"tosca/task{self._cur_task}.pth"
