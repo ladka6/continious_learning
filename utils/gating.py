@@ -159,6 +159,6 @@ class TaskGateWithRandomProjection(nn.Module):
         self.classifier = new_classifier
 
     def forward(self, x):
-        x = x @ self.random_projection
+        x = torch.relu(x @ self.random_projection)
         x = self.backbone(x)
         return self.classifier(x)
