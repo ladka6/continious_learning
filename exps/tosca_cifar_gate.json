@@ -24,14 +24,14 @@
   "milestones": [10, 15],
 
   "routing_mode": "gate",
-  "selection_report_batches": 20,
+  "selection_report_batches": 10,
   "gate_hidden_dim": 0,
   "gate_epochs": 10,
   "gate_lr": 0.001,
   "gate_weight_decay": 0.0,
   "gate_batch_size": 256,
-  "gate_synthetic_per_class": 1000,
-  "gate_min_variance": 1e-6,
+  "gate_synthetic_per_class": 10000,
+  "gate_min_variance": 1e-3,
   "gate_normalize_features": true,
   "gate_projection_dim": 10000
 }

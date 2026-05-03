@@ -64,6 +64,7 @@ def _train(args):
     model = factory.get_model(args["model_name"], args)
 
     cnn_curve, nme_curve = {"top1": [], "top5": []}, {"top1": [], "top5": []}
+    gate_curve = {"top1": []}
     cnn_matrix, nme_matrix = [], []
 
     for task in range(data_manager.nb_tasks):
@@ -72,7 +73,9 @@ def _train(args):
             "Trainable params: {}".format(count_parameters(model._network, True))
         )
         model.incremental_train(data_manager)
-        cnn_accy, nme_accy = model.eval_task()
+        eval_result = model.eval_task()
+        cnn_accy, nme_accy = eval_result[0], eval_result[1]
+        gate_accy = eval_result[2] if len(eval_result) > 2 else None
         routing_comparison = (
             model.eval_routing_comparison()
             if hasattr(model, "eval_routing_comparison")
@@ -127,6 +130,9 @@ def _train(args):
 
             logging.info("Average Accuracy (CNN): {}".format(sum(cnn_curve["top1"])/len(cnn_curve["top1"])))
             logging.info("Average Accuracy (NME): {}".format(sum(nme_curve["top1"])/len(nme_curve["top1"])))
+            if gate_accy is not None:
+                gate_curve["top1"].append(gate_accy["top1"])
+                logging.info("Average Accuracy (Gate): {}".format(sum(gate_curve["top1"]) / len(gate_curve["top1"])))
         else:
             logging.info("No NME accuracy.")
             logging.info("CNN: {}".format(cnn_accy["grouped"]))
@@ -162,6 +168,9 @@ def _train(args):
 
             print('Average Accuracy (CNN):', sum(cnn_curve["top1"])/len(cnn_curve["top1"]))
             logging.info("Average Accuracy (CNN): {} \n".format(sum(cnn_curve["top1"])/len(cnn_curve["top1"])))
+            if gate_accy is not None:
+                gate_curve["top1"].append(gate_accy["top1"])
+                logging.info("Average Accuracy (Gate): {}".format(sum(gate_curve["top1"]) / len(gate_curve["top1"])))
 
     if 'print_forget' in args.keys() and args['print_forget'] is True:
         if len(cnn_matrix) > 0:

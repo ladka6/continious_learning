@@ -183,9 +183,7 @@ class Learner(BaseLearner):
                 torch.empty(0, dtype=torch.long),
             )
 
-        features = torch.cat(all_features, dim=0)
-        features = self._prepare_gate_features(features)
-        return features, torch.cat(all_targets, dim=0)
+        return torch.cat(all_features, dim=0), torch.cat(all_targets, dim=0)
 
     def _init_or_extend_gate(self):
         num_tasks = self._cur_task + 1
@@ -222,6 +220,13 @@ class Learner(BaseLearner):
             num_workers=0,
         )
 
+        assert self._gate is not None
+        if self._gate.num_tasks < 2:
+            logging.info("Gate Task 0: single task, skipping training (nothing to discriminate).")
+            self._gate.eval()
+            self._save_gate()
+            return
+
         optimizer = optim.Adam(self._gate.parameters(), lr=gate_lr, weight_decay=gate_wd)
         criterion = torch.nn.CrossEntropyLoss()
 
@@ -252,6 +257,9 @@ class Learner(BaseLearner):
                 f"Gate Task {self._cur_task}, Epoch {epoch + 1}/{gate_epochs} => "
                 f"Loss {avg_loss:.4f}, Train_accy {train_acc:.2f}"
             )
+            if avg_loss < 1e-4:
+                logging.info(f"Gate converged at epoch {epoch + 1}, stopping early.")
+                break
 
         self._gate.eval()
         self._save_gate()
@@ -364,6 +372,42 @@ class Learner(BaseLearner):
                 "Unknown scheduler {}".format(self.args["scheduler"])
             )
         return scheduler
+
+    def _eval_gate_routing(self, loader):
+        if self._gate is None:
+            return None
+
+        self._gate.eval()
+        correct = 0
+        total = 0
+
+        with torch.no_grad():
+            for _, inputs, targets in loader:
+                inputs = inputs.to(self._device)
+                targets = targets.long()
+
+                features = self._extract_backbone_features(inputs)
+                features = self._prepare_gate_features(features)
+                gate_logits = self._gate(features)
+                chosen_task = torch.argmax(gate_logits, dim=1).cpu()
+
+                true_task = torch.zeros_like(targets)
+                for t, (start, end) in enumerate(self._task_ranges):
+                    mask = (targets >= start) & (targets < end)
+                    true_task[mask] = t
+
+                correct += (chosen_task == true_task).sum().item()
+                total += targets.size(0)
+
+        gate_acc = 100.0 * correct / total if total > 0 else 0.0
+        return {"top1": gate_acc}
+
+    def eval_task(self):
+        y_pred, y_true = self._eval_cnn(self.test_loader)
+        cnn_accy = self._evaluate(y_pred, y_true)
+        nme_accy = None
+        gate_accy = self._eval_gate_routing(self.test_loader)
+        return cnn_accy, nme_accy, gate_accy
 
     def _eval_cnn(self, loader):
         self._network.eval()
