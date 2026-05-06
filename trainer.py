@@ -132,6 +132,7 @@ def _train(args):
             logging.info("Average Accuracy (NME): {}".format(sum(nme_curve["top1"])/len(nme_curve["top1"])))
             if gate_accy is not None:
                 gate_curve["top1"].append(gate_accy["top1"])
+                logging.info("Gate top1 curve: {}".format(gate_curve["top1"]))
                 logging.info("Average Accuracy (Gate): {}".format(sum(gate_curve["top1"]) / len(gate_curve["top1"])))
         else:
             logging.info("No NME accuracy.")
@@ -170,6 +171,7 @@ def _train(args):
             logging.info("Average Accuracy (CNN): {} \n".format(sum(cnn_curve["top1"])/len(cnn_curve["top1"])))
             if gate_accy is not None:
                 gate_curve["top1"].append(gate_accy["top1"])
+                logging.info("Gate top1 curve: {}".format(gate_curve["top1"]))
                 logging.info("Average Accuracy (Gate): {}".format(sum(gate_curve["top1"]) / len(gate_curve["top1"])))
 
     if 'print_forget' in args.keys() and args['print_forget'] is True:

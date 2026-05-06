@@ -34,5 +34,5 @@
   "gate_min_variance": 1e-3,
   "gate_normalize_features": true,
   "gate_variance_shrinkage": 0.1,
-  "gate_projection_dim": 10000
+  "gate_projection_dim": 5000
 }
