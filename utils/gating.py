@@ -3,16 +3,24 @@ from torch import nn
 
 
 class FeatureStatsCollector:
-    def __init__(self, feature_dim, min_variance=1e-6):
+    def __init__(self, feature_dim, min_variance=1e-6, variance_shrinkage=0.0):
         self.feature_dim = feature_dim
         self.min_variance = min_variance
+        self.variance_shrinkage = float(variance_shrinkage)
         self._class_sums = {}
         self._class_sumsq = {}
         self._class_counts = {}
+        self._global_sum = torch.zeros(self.feature_dim)
+        self._global_sumsq = torch.zeros(self.feature_dim)
+        self._global_count = 0
 
     def update(self, features, labels):
         features = features.detach().cpu().float()
         labels = labels.detach().cpu().long()
+
+        self._global_sum += features.sum(dim=0)
+        self._global_sumsq += torch.sum(features * features, dim=0)
+        self._global_count += features.size(0)
 
         unique_labels = labels.unique()
         for class_id in unique_labels:
@@ -35,10 +43,20 @@ class FeatureStatsCollector:
 
     def compute_mean_variance(self):
         class_stats = {}
+        global_count = max(self._global_count, 1)
+        global_mean = self._global_sum / global_count
+        global_variance = self._global_sumsq / global_count - global_mean * global_mean
+        global_variance = torch.clamp(global_variance, min=self.min_variance)
+
         for class_idx in sorted(self._class_counts.keys()):
             count = max(self._class_counts[class_idx], 1)
             mean = self._class_sums[class_idx] / count
             variance = self._class_sumsq[class_idx] / count - mean * mean
+            if self.variance_shrinkage > 0.0:
+                variance = (
+                    (1.0 - self.variance_shrinkage) * variance
+                    + self.variance_shrinkage * global_variance
+                )
             variance = torch.clamp(variance, min=self.min_variance)
             class_stats[class_idx] = {
                 "mean": mean.float(),

@@ -144,6 +144,7 @@ class Learner(BaseLearner):
         collector = FeatureStatsCollector(
             feature_dim=self._network.feature_dim,
             min_variance=self.args.get("gate_min_variance", 1e-6),
+            variance_shrinkage=self.args.get("gate_variance_shrinkage", 0.0),
         )
 
         with torch.no_grad():
