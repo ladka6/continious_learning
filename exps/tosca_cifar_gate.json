@@ -33,5 +33,6 @@
   "gate_synthetic_per_class": 10000,
   "gate_min_variance": 1e-3,
   "gate_normalize_features": true,
+  "gate_stats_mode": "covariance",
   "gate_projection_dim": 10000
 }
