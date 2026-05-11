@@ -6,7 +6,7 @@ from torch import optim
 from torch.nn import functional as F
 from torch.utils.data import DataLoader, TensorDataset
 
-from utils.gating import FeatureStatsCollector, TaskGateWithRandomProjection, generate_samples
+from utils.gating import FeatureStatsCollector, TaskGate, generate_samples
 from utils.inc_net import SimpleVitNet
 from models.base import BaseLearner
 from utils.toolkit import tensor2numpy
@@ -26,6 +26,8 @@ class Learner(BaseLearner):
         # Gate components
         self._gate = None
         self._task_feature_stats = {}
+        self._random_projection = None
+        self._projection_dim = int(self.args.get("gate_projection_dim", 10000))
 
     def incremental_train(self, data_manager):
         self._cur_task += 1
@@ -57,7 +59,7 @@ class Learner(BaseLearner):
             np.arange(0, self._total_classes), source="test", mode="test"
         )
         self.test_loader = DataLoader(
-            test_dataset, batch_size=48, shuffle=False, num_workers=num_workers
+            test_dataset, batch_size=48, shuffle=True, num_workers=num_workers
         )
 
         train_dataset_for_protonet = data_manager.get_dataset(
@@ -136,13 +138,31 @@ class Learner(BaseLearner):
 
     def _prepare_gate_features(self, features):
         if self.args.get("gate_normalize_features", True):
-            return F.normalize(features, p=2, dim=1)
+            features = F.normalize(features, p=2, dim=1)
         return features
+
+    def _ensure_random_projection(self):
+        if self._random_projection is None:
+            generator = torch.Generator(device="cpu")
+            seed = int(self.args.get("gate_projection_seed", 0))
+            if seed:
+                generator.manual_seed(seed)
+            proj = torch.randn(
+                int(self._network.feature_dim),
+                int(self._projection_dim),
+                generator=generator,
+            )
+            self._random_projection = proj.to(self._device)
+
+    def _project_features(self, features):
+        self._ensure_random_projection()
+        return torch.relu(features @ self._random_projection)
 
     def _collect_current_task_statistics(self):
         self._network.eval()
+        self._ensure_random_projection()
         collector = FeatureStatsCollector(
-            feature_dim=self._network.feature_dim,
+            feature_dim=self._projection_dim,
             min_variance=self.args.get("gate_min_variance", 1e-6),
             stats_mode=self.args.get("gate_stats_mode", "diag"),
         )
@@ -152,6 +172,7 @@ class Learner(BaseLearner):
                 data = data.to(self._device)
                 features = self._extract_backbone_features(data)
                 features = self._prepare_gate_features(features)
+                features = self._project_features(features)
                 collector.update(features, label)
 
         class_stats = collector.compute_mean_variance()
@@ -168,20 +189,23 @@ class Learner(BaseLearner):
                 class_stats,
                 n_samples=synthetic_per_class,
                 min_variance=min_variance,
-                device="cpu",
+                device=self._device,
             )
             if sampled_features.numel() == 0:
                 continue
             task_targets = torch.full(
-                (sampled_features.size(0),), task_idx, dtype=torch.long
+                (sampled_features.size(0),),
+                task_idx,
+                dtype=torch.long,
+                device=self._device,
             )
             all_features.append(sampled_features)
             all_targets.append(task_targets)
 
         if len(all_features) == 0:
             return (
-                torch.empty(0, self._network.feature_dim),
-                torch.empty(0, dtype=torch.long),
+                torch.empty(0, self._projection_dim, device=self._device),
+                torch.empty(0, dtype=torch.long, device=self._device),
             )
 
         return torch.cat(all_features, dim=0), torch.cat(all_targets, dim=0)
@@ -189,11 +213,10 @@ class Learner(BaseLearner):
     def _init_or_extend_gate(self):
         num_tasks = self._cur_task + 1
         if self._gate is None:
-            self._gate = TaskGateWithRandomProjection(
-                input_dim=self._network.feature_dim,
+            self._gate = TaskGate(
+                input_dim=self._projection_dim,
                 num_tasks=num_tasks,
                 hidden_dim=int(self.args.get("gate_hidden_dim", 0)),
-                projection_dim=int(self.args.get("gate_projection_dim", 10000)),
             ).to(self._device)
         else:
             self._gate.extend(num_tasks)
@@ -290,6 +313,7 @@ class Learner(BaseLearner):
         self._gate.eval()
         features = self._extract_backbone_features(inputs)
         features = self._prepare_gate_features(features)
+        features = self._project_features(features)
         gate_logits = self._gate(features)
         chosen_task = torch.argmax(gate_logits, dim=1)
 
@@ -389,6 +413,7 @@ class Learner(BaseLearner):
 
                 features = self._extract_backbone_features(inputs)
                 features = self._prepare_gate_features(features)
+                features = self._project_features(features)
                 gate_logits = self._gate(features)
                 chosen_task = torch.argmax(gate_logits, dim=1).cpu()
 
