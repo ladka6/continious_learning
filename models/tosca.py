@@ -189,23 +189,20 @@ class Learner(BaseLearner):
                 class_stats,
                 n_samples=synthetic_per_class,
                 min_variance=min_variance,
-                device=self._device,
+                device="cpu",
             )
             if sampled_features.numel() == 0:
                 continue
             task_targets = torch.full(
-                (sampled_features.size(0),),
-                task_idx,
-                dtype=torch.long,
-                device=self._device,
+                (sampled_features.size(0),), task_idx, dtype=torch.long
             )
             all_features.append(sampled_features)
             all_targets.append(task_targets)
 
         if len(all_features) == 0:
             return (
-                torch.empty(0, self._projection_dim, device=self._device),
-                torch.empty(0, dtype=torch.long, device=self._device),
+                torch.empty(0, self._projection_dim),
+                torch.empty(0, dtype=torch.long),
             )
 
         return torch.cat(all_features, dim=0), torch.cat(all_targets, dim=0)
