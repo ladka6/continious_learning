@@ -8,7 +8,9 @@ def get_backbone(args, pretrained=False):
     name = args["backbone_type"].lower()
     type = args["model_name"].lower()
     
-    if type == "adaptive_gating_tosca":
+    if type == "adaptive_gating_tosca" or (
+        type == "tosca" and name.endswith("_adapter")
+    ):
         ffn_num = args["ffn_num"]
         from backbone import vit_adapter
         from backbone import adaptive_tosca
