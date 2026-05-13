@@ -7,7 +7,7 @@ from torch.nn import functional as F
 from torch.utils.data import DataLoader, TensorDataset
 
 from utils.gating import FeatureStatsCollector, TaskGate, generate_samples
-from utils.inc_net import SimpleVitNet
+from utils.inc_net import SimpleAdaptiveVitNet
 from models.base import BaseLearner
 from utils.toolkit import tensor2numpy
 
@@ -17,7 +17,7 @@ num_workers = 10
 class Learner(BaseLearner):
     def __init__(self, args):
         super().__init__(args)
-        self._network = SimpleVitNet(args, True)
+        self._network = SimpleAdaptiveVitNet(args, True)
         self.args = args
 
         # Task boundaries: task_ranges[i] = (start_class, end_class)
@@ -26,8 +26,10 @@ class Learner(BaseLearner):
         # Gate components
         self._gate = None
         self._task_feature_stats = {}
-        self._random_projection = None
-        self._projection_dim = int(self.args.get("gate_projection_dim", 10000))
+
+    @property
+    def _projection_dim(self):
+        return int(self._get_backbone().M)
 
     def incremental_train(self, data_manager):
         self._cur_task += 1
@@ -78,6 +80,7 @@ class Learner(BaseLearner):
 
     def _train(self):
         self._network.to(self._device)
+        self._set_trainable()
         optimizer = self.get_optimizer(lr=self.args["lr"])
         scheduler = self.get_scheduler(optimizer, self.args["epochs"])
 
@@ -132,6 +135,16 @@ class Learner(BaseLearner):
             return self._network.module.backbone
         return self._network.backbone
 
+    def _set_trainable(self):
+        # Adapters and W_rand frozen entirely; train only tosca + fc.
+        for p in self._network.parameters():
+            p.requires_grad = False
+        backbone = self._get_backbone()
+        for p in backbone.tosca.parameters():
+            p.requires_grad = True
+        for p in self._network.fc.parameters():
+            p.requires_grad = True
+
     def _extract_backbone_features(self, inputs):
         backbone = self._get_backbone()
         return backbone.forward_features(inputs)
@@ -141,26 +154,12 @@ class Learner(BaseLearner):
             features = F.normalize(features, p=2, dim=1)
         return features
 
-    def _ensure_random_projection(self):
-        if self._random_projection is None:
-            generator = torch.Generator(device="cpu")
-            seed = int(self.args.get("gate_projection_seed", 0))
-            if seed:
-                generator.manual_seed(seed)
-            proj = torch.randn(
-                int(self._network.feature_dim),
-                int(self._projection_dim),
-                generator=generator,
-            )
-            self._random_projection = proj.to(self._device)
-
     def _project_features(self, features):
-        self._ensure_random_projection()
-        return torch.relu(features @ self._random_projection)
+        backbone = self._get_backbone()
+        return torch.relu(features @ backbone.W_rand)
 
     def _collect_current_task_statistics(self):
         self._network.eval()
-        self._ensure_random_projection()
         collector = FeatureStatsCollector(
             feature_dim=self._projection_dim,
             min_variance=self.args.get("gate_min_variance", 1e-6),
@@ -294,7 +293,7 @@ class Learner(BaseLearner):
             {
                 "state_dict": self._gate.state_dict(),
                 "num_tasks": self._cur_task + 1,
-                "input_dim": self._network.feature_dim,
+                "input_dim": self._projection_dim,
                 "hidden_dim": int(self.args.get("gate_hidden_dim", 0)),
             },
             path,
