@@ -136,7 +136,8 @@ class Learner(BaseLearner):
         return self._network.backbone
 
     def _set_trainable(self):
-        # Adapters and W_rand frozen entirely; train only tosca + fc.
+        # Adapters trainable on task 0 only, frozen afterwards.
+        # W_rand always frozen. Tosca + fc trainable every task.
         for p in self._network.parameters():
             p.requires_grad = False
         backbone = self._get_backbone()
@@ -144,6 +145,10 @@ class Learner(BaseLearner):
             p.requires_grad = True
         for p in self._network.fc.parameters():
             p.requires_grad = True
+        if self._cur_task == 0:
+            for name, p in backbone.vit.named_parameters():
+                if "adaptmlp" in name:
+                    p.requires_grad = True
 
     def _extract_backbone_features(self, inputs):
         backbone = self._get_backbone()
