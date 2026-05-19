@@ -1,6 +1,7 @@
 import logging
 import numpy as np
 import torch
+import time
 from tqdm import tqdm
 from torch import optim
 from torch.nn import functional as F
@@ -28,6 +29,7 @@ class Learner(BaseLearner):
         self._task_feature_stats = {}
         self._random_projection = None
         self._projection_dim = int(self.args.get("gate_projection_dim", 10000))
+        self._latest_task_timing = {}
 
     def incremental_train(self, data_manager):
         self._cur_task += 1
@@ -77,10 +79,12 @@ class Learner(BaseLearner):
         self._train()
 
     def _train(self):
+        task_train_start = time.perf_counter()
         self._network.to(self._device)
         optimizer = self.get_optimizer(lr=self.args["lr"])
         scheduler = self.get_scheduler(optimizer, self.args["epochs"])
 
+        backbone_train_start = time.perf_counter()
         prog_bar = tqdm(range(self.args["epochs"]))
         for _, epoch in enumerate(prog_bar):
             self._network.train()
@@ -120,12 +124,38 @@ class Learner(BaseLearner):
             prog_bar.set_description(info)
 
         logging.info(info)
+        backbone_train_seconds = time.perf_counter() - backbone_train_start
         self._save_tosca()
 
+        stats_start = time.perf_counter()
         self._collect_current_task_statistics()
+        stats_seconds = time.perf_counter() - stats_start
+        gate_train_start = time.perf_counter()
         self._train_gate()
+        gate_train_seconds = time.perf_counter() - gate_train_start
 
+        replace_fc_start = time.perf_counter()
         self.replace_fc()
+        replace_fc_seconds = time.perf_counter() - replace_fc_start
+        task_train_seconds = time.perf_counter() - task_train_start
+
+        self._latest_task_timing = {
+            "backbone_train_seconds": backbone_train_seconds,
+            "stats_collection_seconds": stats_seconds,
+            "gate_train_seconds": gate_train_seconds,
+            "replace_fc_seconds": replace_fc_seconds,
+            "task_train_seconds": task_train_seconds,
+        }
+        logging.info(
+            "Task {} timing => backbone_train {:.2f}s, stats {:.2f}s, gate_train {:.2f}s, replace_fc {:.2f}s, total_train {:.2f}s".format(
+                self._cur_task,
+                backbone_train_seconds,
+                stats_seconds,
+                gate_train_seconds,
+                replace_fc_seconds,
+                task_train_seconds,
+            )
+        )
 
     def _get_backbone(self):
         if isinstance(self._network, torch.nn.DataParallel):
@@ -405,6 +435,10 @@ class Learner(BaseLearner):
         self._gate.eval()
         correct = 0
         total = 0
+        per_task = {
+            task_idx: {"correct": 0, "total": 0, "predicted": 0}
+            for task_idx in range(len(self._task_ranges))
+        }
 
         with torch.no_grad():
             for _, inputs, targets in loader:
@@ -424,15 +458,64 @@ class Learner(BaseLearner):
 
                 correct += (chosen_task == true_task).sum().item()
                 total += targets.size(0)
+                for task_idx in range(len(self._task_ranges)):
+                    true_mask = true_task == task_idx
+                    pred_mask = chosen_task == task_idx
+                    per_task[task_idx]["total"] += true_mask.sum().item()
+                    per_task[task_idx]["correct"] += (
+                        (chosen_task[true_mask] == true_task[true_mask]).sum().item()
+                    )
+                    per_task[task_idx]["predicted"] += pred_mask.sum().item()
 
         gate_acc = 100.0 * correct / total if total > 0 else 0.0
-        return {"top1": gate_acc}
+        for task_idx, stats in per_task.items():
+            task_total = stats["total"]
+            stats["accuracy"] = (
+                100.0 * stats["correct"] / task_total if task_total > 0 else 0.0
+            )
+        return {"top1": gate_acc, "per_task": per_task}
+
+    def _compute_gate_routing_flops(self, batch_size=1):
+        input_dim = int(self._network.feature_dim)
+        projection_dim = int(self._projection_dim)
+        hidden_dim = int(self.args.get("gate_hidden_dim", 0))
+        num_tasks = max(self._cur_task + 1, 1)
+
+        projection_flops = 2 * input_dim * projection_dim
+        relu_projection_flops = projection_dim
+
+        if hidden_dim > 0:
+            hidden_flops = 2 * projection_dim * hidden_dim + hidden_dim
+            classifier_flops = 2 * hidden_dim * num_tasks
+        else:
+            hidden_flops = 0
+            classifier_flops = 2 * projection_dim * num_tasks
+
+        per_sample_flops = (
+            projection_flops
+            + relu_projection_flops
+            + hidden_flops
+            + classifier_flops
+        )
+        return {
+            "per_sample": int(per_sample_flops),
+            "per_batch": int(per_sample_flops * batch_size),
+            "batch_size": int(batch_size),
+            "num_tasks": int(num_tasks),
+        }
 
     def eval_task(self):
+        eval_start = time.perf_counter()
         y_pred, y_true = self._eval_cnn(self.test_loader)
         cnn_accy = self._evaluate(y_pred, y_true)
         nme_accy = None
         gate_accy = self._eval_gate_routing(self.test_loader)
+        eval_seconds = time.perf_counter() - eval_start
+        num_samples = len(self.test_loader.dataset)
+        gate_flops = self._compute_gate_routing_flops(batch_size=self.test_loader.batch_size)
+        gate_accy["eval_seconds"] = eval_seconds
+        gate_accy["ms_per_sample"] = 1000.0 * eval_seconds / max(num_samples, 1)
+        gate_accy["routing_flops"] = gate_flops
         return cnn_accy, nme_accy, gate_accy
 
     def _eval_cnn(self, loader):
