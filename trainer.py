@@ -2,6 +2,7 @@ import sys
 import logging
 import copy
 import torch
+import time
 from utils import factory
 from utils.data_manager import DataManager
 from utils.toolkit import count_parameters
@@ -72,8 +73,17 @@ def _train(args):
         logging.info(
             "Trainable params: {}".format(count_parameters(model._network, True))
         )
+        task_wall_start = time.perf_counter()
         model.incremental_train(data_manager)
+        task_train_only_seconds = time.perf_counter() - task_wall_start
+        logging.info(
+            "Task {} wall-clock training time: {:.2f}s".format(
+                task, task_train_only_seconds
+            )
+        )
+        eval_wall_start = time.perf_counter()
         eval_result = model.eval_task()
+        eval_wall_seconds = time.perf_counter() - eval_wall_start
         cnn_accy, nme_accy = eval_result[0], eval_result[1]
         gate_accy = eval_result[2] if len(eval_result) > 2 else None
         routing_comparison = (
@@ -132,7 +142,9 @@ def _train(args):
             logging.info("Average Accuracy (NME): {}".format(sum(nme_curve["top1"])/len(nme_curve["top1"])))
             if gate_accy is not None:
                 gate_curve["top1"].append(gate_accy["top1"])
+                logging.info("Gate top1 curve: {}".format(gate_curve["top1"]))
                 logging.info("Average Accuracy (Gate): {}".format(sum(gate_curve["top1"]) / len(gate_curve["top1"])))
+                _log_gate_metrics(task, gate_accy, eval_wall_seconds)
         else:
             logging.info("No NME accuracy.")
             logging.info("CNN: {}".format(cnn_accy["grouped"]))
@@ -170,7 +182,9 @@ def _train(args):
             logging.info("Average Accuracy (CNN): {} \n".format(sum(cnn_curve["top1"])/len(cnn_curve["top1"])))
             if gate_accy is not None:
                 gate_curve["top1"].append(gate_accy["top1"])
+                logging.info("Gate top1 curve: {}".format(gate_curve["top1"]))
                 logging.info("Average Accuracy (Gate): {}".format(sum(gate_curve["top1"]) / len(gate_curve["top1"])))
+                _log_gate_metrics(task, gate_accy, eval_wall_seconds)
 
     if 'print_forget' in args.keys() and args['print_forget'] is True:
         if len(cnn_matrix) > 0:
@@ -221,3 +235,40 @@ def _set_random(seed=1):
 def print_args(args):
     for key, value in args.items():
         logging.info("{}: {}".format(key, value))
+
+
+def _log_gate_metrics(task, gate_accy, eval_wall_seconds):
+    logging.info("Task {} eval time: {:.2f}s".format(task, eval_wall_seconds))
+
+    if "eval_seconds" in gate_accy:
+        logging.info(
+            "Gate routing eval time: {:.2f}s ({:.3f} ms/sample)".format(
+                gate_accy["eval_seconds"],
+                gate_accy.get("ms_per_sample", 0.0),
+            )
+        )
+
+    routing_flops = gate_accy.get("routing_flops")
+    if routing_flops is not None:
+        logging.info(
+            "Gate routing FLOPs => per_sample: {}, per_batch@{}: {}, num_tasks: {}".format(
+                routing_flops["per_sample"],
+                routing_flops["batch_size"],
+                routing_flops["per_batch"],
+                routing_flops["num_tasks"],
+            )
+        )
+
+    per_task = gate_accy.get("per_task")
+    if per_task:
+        logging.info("Gate routing task-by-task after Task {}".format(task))
+        for task_idx, stats in per_task.items():
+            logging.info(
+                "  True Task {} => correct {}/{} ({:.2f}%), predicted_as_task {} times".format(
+                    task_idx,
+                    stats["correct"],
+                    stats["total"],
+                    stats["accuracy"],
+                    stats["predicted"],
+                )
+            )
