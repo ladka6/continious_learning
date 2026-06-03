@@ -155,6 +155,63 @@ class TaskGate(nn.Module):
         x = self.backbone(x)
         return self.classifier(x)
 
+
+class RidgeTaskGate(nn.Module):
+    def __init__(self, input_dim, num_tasks=1, ridge_lambda=1.0):
+        super().__init__()
+        self.input_dim = int(input_dim)
+        self.ridge_lambda = float(ridge_lambda)
+        self.register_buffer("weight", torch.zeros(self.input_dim, num_tasks))
+        self.register_buffer("bias", torch.zeros(num_tasks))
+
+    @property
+    def num_tasks(self):
+        return int(self.bias.numel())
+
+    def extend(self, num_tasks):
+        if num_tasks <= self.num_tasks:
+            return
+
+        device = self.weight.device
+        new_weight = torch.zeros(self.input_dim, num_tasks, device=device)
+        new_bias = torch.zeros(num_tasks, device=device)
+        new_weight[:, : self.num_tasks].copy_(self.weight)
+        new_bias[: self.num_tasks].copy_(self.bias)
+        self.weight = new_weight
+        self.bias = new_bias
+
+    @torch.no_grad()
+    def fit(self, features, task_ids):
+        if features.numel() == 0:
+            return
+
+        features = features.float()
+        task_ids = task_ids.long()
+        num_tasks = max(int(task_ids.max().item()) + 1, self.num_tasks)
+        self.extend(num_tasks)
+
+        one_hot_targets = torch.zeros(
+            features.size(0), num_tasks, device=features.device, dtype=features.dtype
+        )
+        one_hot_targets.scatter_(1, task_ids.unsqueeze(1), 1.0)
+
+        ones = torch.ones(features.size(0), 1, device=features.device, dtype=features.dtype)
+        design = torch.cat([features, ones], dim=1)
+
+        gram = design.transpose(0, 1) @ design
+        reg = self.ridge_lambda * torch.eye(
+            gram.size(0), device=features.device, dtype=features.dtype
+        )
+        reg[-1, -1] = 0.0
+        rhs = design.transpose(0, 1) @ one_hot_targets
+        solution = torch.linalg.solve(gram + reg, rhs)
+
+        self.weight.copy_(solution[:-1])
+        self.bias.copy_(solution[-1])
+
+    def forward(self, x):
+        return x @ self.weight + self.bias
+
 class TaskGateWithRandomProjection(nn.Module):
     def __init__(self, input_dim, num_tasks=1, hidden_dim=0, projection_dim=10000):
         super().__init__()

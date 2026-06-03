@@ -10,7 +10,7 @@ from tqdm import tqdm
 from utils.inc_net import SimpleAdaptiveVitNet
 from models.base import BaseLearner
 from utils.toolkit import tensor2numpy
-from utils.gating import FeatureStatsCollector, TaskGate, generate_samples
+from utils.gating import FeatureStatsCollector, RidgeTaskGate, TaskGate, generate_samples
 
 num_workers = 10
 TOSCA_DIR = "tosca"
@@ -30,6 +30,7 @@ class Learner(BaseLearner):
         
         self._gate = None
         self._task_feature_stats = {}
+        self._gate_classifier = self.args.get("gate_classifier", "ridge").lower()
         
         os.makedirs(TOSCA_DIR, exist_ok=True)
 
@@ -139,11 +140,18 @@ class Learner(BaseLearner):
     def _init_or_extend_gate(self):
         num_tasks = self._cur_task + 1
         if self._gate is None:
-            self._gate = TaskGate(
-                input_dim=self._network.backbone.embed_dim,
-                num_tasks=num_tasks,
-                hidden_dim=int(self.args.get("gate_hidden_dim", 0)),
-            ).to(self._device)
+            if self._gate_classifier == "ridge":
+                self._gate = RidgeTaskGate(
+                    input_dim=self._network.backbone.embed_dim,
+                    num_tasks=num_tasks,
+                    ridge_lambda=float(self.args.get("gate_ridge_lambda", 1.0)),
+                ).to(self._device)
+            else:
+                self._gate = TaskGate(
+                    input_dim=self._network.backbone.embed_dim,
+                    num_tasks=num_tasks,
+                    hidden_dim=int(self.args.get("gate_hidden_dim", 0)),
+                ).to(self._device)
         else:
             self._gate.extend(num_tasks)
             self._gate.to(self._device)
@@ -200,43 +208,63 @@ class Learner(BaseLearner):
             logging.warning("No synthetic features available for gate training.")
             return
 
-        gate_batch_size = int(self.args.get("gate_batch_size", 256))
-        gate_epochs = int(self.args.get("gate_epochs", 10))
-        gate_lr = float(self.args.get("gate_lr", 1e-3))
-        gate_wd = float(self.args.get("gate_weight_decay", 0.0))
+        if self._gate.num_tasks < 2:
+            logging.info("Gate Task 0: single task, skipping training (nothing to discriminate).")
+            self._gate.eval()
+            self._save_gate()
+            return
 
-        gate_dataset = TensorDataset(train_x, train_y)
-        gate_loader = DataLoader(
-            gate_dataset,
-            batch_size=gate_batch_size,
-            shuffle=True,
-            num_workers=0,
-        )
-
-        optimizer = optim.Adam(self._gate.parameters(), lr=gate_lr, weight_decay=gate_wd)
-        criterion = torch.nn.CrossEntropyLoss()
-
-        self._gate.train()
-        for epoch in range(gate_epochs):
-            epoch_loss = 0.0
-            correct = 0
-            total = 0
-
-            for features, task_ids in gate_loader:
-                features = features.to(self._device)
-                task_ids = task_ids.to(self._device)
-
-                optimizer.zero_grad()
-                logits = self._gate(features)
-                loss = criterion(logits, task_ids)
-                loss.backward()
-                optimizer.step()
-
-                epoch_loss += loss.item()
+        if self._gate_classifier == "ridge":
+            train_x = train_x.to(self._device)
+            train_y = train_y.to(self._device)
+            self._gate.fit(train_x, train_y)
+            with torch.no_grad():
+                logits = self._gate(train_x)
+                loss = F.cross_entropy(logits, train_y)
                 preds = torch.argmax(logits, dim=1)
-                correct += (preds == task_ids).sum().item()
-                total += task_ids.size(0)
+                train_acc = 100.0 * (preds == train_y).sum().item() / max(
+                    train_y.size(0), 1
+                )
+            logging.info(
+                f"Gate Task {self._cur_task}, Ridge fit => Loss {loss.item():.4f}, Train_accy {train_acc:.2f}"
+            )
+        else:
+            gate_batch_size = int(self.args.get("gate_batch_size", 256))
+            gate_epochs = int(self.args.get("gate_epochs", 10))
+            gate_lr = float(self.args.get("gate_lr", 1e-3))
+            gate_wd = float(self.args.get("gate_weight_decay", 0.0))
 
+            gate_dataset = TensorDataset(train_x, train_y)
+            gate_loader = DataLoader(
+                gate_dataset,
+                batch_size=gate_batch_size,
+                shuffle=True,
+                num_workers=0,
+            )
+
+            optimizer = optim.Adam(self._gate.parameters(), lr=gate_lr, weight_decay=gate_wd)
+            criterion = torch.nn.CrossEntropyLoss()
+
+            self._gate.train()
+            for epoch in range(gate_epochs):
+                epoch_loss = 0.0
+                correct = 0
+                total = 0
+
+                for features, task_ids in gate_loader:
+                    features = features.to(self._device)
+                    task_ids = task_ids.to(self._device)
+
+                    optimizer.zero_grad()
+                    logits = self._gate(features)
+                    loss = criterion(logits, task_ids)
+                    loss.backward()
+                    optimizer.step()
+
+                    epoch_loss += loss.item()
+                    preds = torch.argmax(logits, dim=1)
+                    correct += (preds == task_ids).sum().item()
+                    total += task_ids.size(0)
 
         self._gate.eval()
         self._save_gate()
@@ -251,6 +279,8 @@ class Learner(BaseLearner):
                 "state_dict": self._gate.state_dict(),
                 "num_tasks": self._cur_task + 1,
                 "input_dim": self._network.backbone.embed_dim,
+                "gate_classifier": self._gate_classifier,
+                "gate_ridge_lambda": float(self.args.get("gate_ridge_lambda", 1.0)),
                 "hidden_dim": int(self.args.get("gate_hidden_dim", 0)),
             },
             path,

@@ -27,6 +27,8 @@
   "milestones": [10, 15],
 
   "routing_mode": "gate",
+  "gate_classifier": "ridge",
+  "gate_ridge_lambda": 1.0,
   "selection_report_batches": 10,
   "gate_hidden_dim": 0,
   "gate_epochs": 10,
