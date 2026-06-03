@@ -34,6 +34,7 @@
   "gate_weight_decay": 0.0,
   "gate_batch_size": 256,
   "gate_synthetic_per_class": 500,
+  "n_centroids": 10,
   "gate_min_variance": 1e-3,
   "gate_normalize_features": true,
   "gate_stats_mode": "covariance"

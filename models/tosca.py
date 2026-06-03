@@ -199,6 +199,7 @@ class Learner(BaseLearner):
             feature_dim=self._projection_dim,
             min_variance=self.args.get("gate_min_variance", 1e-6),
             stats_mode=self.args.get("gate_stats_mode", "diag"),
+            n_centroids=self.args.get("n_centroids", 10),
         )
 
         with torch.no_grad():

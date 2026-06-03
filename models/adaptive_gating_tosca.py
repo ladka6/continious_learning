@@ -150,7 +150,12 @@ class Learner(BaseLearner):
             
     def _collect_current_task_stats(self):
         self._network.eval()
-        collector = FeatureStatsCollector(feature_dim=self._network.backbone.embed_dim)
+        collector = FeatureStatsCollector(
+            feature_dim=self._network.backbone.embed_dim,
+            min_variance=self.args.get("gate_min_variance", 1e-6),
+            stats_mode=self.args.get("gate_stats_mode", "diag"),
+            n_centroids=self.args.get("n_centroids", 10),
+        )
         with torch.no_grad():
             for _, data, label in self.train_loader_for_protonet:
                 data = data.to(self._device)
