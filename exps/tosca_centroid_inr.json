@@ -37,5 +37,5 @@
   "n_centroids": 10,
   "gate_min_variance": 1e-6,
   "gate_normalize_features": true,
-  "gate_stats_mode": "covariance"
+  "gate_stats_mode": "multi-centroid"
 }
