@@ -10,7 +10,12 @@ from tqdm import tqdm
 from utils.inc_net import SimpleAdaptiveVitNet
 from models.base import BaseLearner
 from utils.toolkit import tensor2numpy
-from utils.gating import FeatureStatsCollector, TaskGate, generate_samples
+from utils.gating import (
+    FeatureStatsCollector,
+    TaskGate,
+    generate_fetril_features,
+    generate_samples,
+)
 
 num_workers = 10
 TOSCA_DIR = "tosca"
@@ -37,7 +42,9 @@ class Learner(BaseLearner):
         self._cur_task += 1
         self._total_classes = self._known_classes + data_manager.get_task_size(self._cur_task)
         self._network.update_fc(self._total_classes)
+        self.task_ranges.append((self._known_classes, self._total_classes))
         logging.info("Learning on {}-{}".format(self._known_classes, self._total_classes))
+        logging.info(f"Task ranges so far: {self.task_ranges}")
 
         self.train_dataset = data_manager.get_dataset(
             np.arange(self._known_classes, self._total_classes),
@@ -160,11 +167,44 @@ class Learner(BaseLearner):
                 collector.update(features, label)
                 
         class_stats = collector.compute_mean_variance()
+        if self.args.get("gate_stats_mode", "diag") == "fetril":
+            for task_idx, task_stats in self._task_feature_stats.items():
+                if task_idx == self._cur_task:
+                    continue
+                for stats in task_stats.values():
+                    stats.pop("features", None)
         self._task_feature_stats[self._cur_task] = class_stats
+
+    def _class_to_task_idx(self, class_idx):
+        for task_idx, (start, end) in enumerate(self.task_ranges):
+            if start <= class_idx < end:
+                return task_idx
+        raise ValueError(f"Class {class_idx} is outside known task ranges {self.task_ranges}")
         
     def _collect_all_synthetic_features(self):
         synthetic_per_class = int(self.args.get("gate_synthetic_per_class", 200))
         min_variance = self.args.get("gate_min_variance", 1e-6)
+        stats_mode = self.args.get("gate_stats_mode", "diag")
+
+        if stats_mode == "fetril":
+            sampled_features, class_labels = generate_fetril_features(
+                self._task_feature_stats,
+                current_task=self._cur_task,
+                n_samples=synthetic_per_class,
+                device="cpu",
+                source_strategy=self.args.get("fetril_source_strategy", "nearest"),
+                topk=int(self.args.get("fetril_topk", 1)),
+            )
+            if class_labels.numel() == 0:
+                return (
+                    torch.empty(0, self._network.backbone.embed_dim),
+                    torch.empty(0, dtype=torch.long),
+                )
+            task_targets = torch.tensor(
+                [self._class_to_task_idx(int(class_idx)) for class_idx in class_labels.tolist()],
+                dtype=torch.long,
+            )
+            return sampled_features, task_targets
 
         all_features, all_targets = [], []
         for task_idx in range(self._cur_task + 1):
