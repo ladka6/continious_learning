@@ -93,7 +93,7 @@ def download_data(self):
 python main.py --config=./exps/tosca_[DATASET].json
 ```
 
-For gated task routing (collector + synthetic replay + gate), use:
+For gated task routing (stored ViT feature memory + gate), use:
 
 ```bash
 python main.py --config=./exps/tosca_cifar_gate.json

@@ -7,7 +7,7 @@ from torch import optim
 from torch.nn import functional as F
 from torch.utils.data import DataLoader, TensorDataset
 
-from utils.gating import FeatureStatsCollector, TaskGate, generate_samples
+from utils.gating import TaskGate
 from utils.inc_net import SimpleAdaptiveVitNet
 from models.base import BaseLearner
 from utils.toolkit import tensor2numpy
@@ -26,12 +26,12 @@ class Learner(BaseLearner):
 
         # Gate components
         self._gate = None
-        self._task_feature_stats = {}
+        self._task_feature_memory = {}
         self._latest_task_timing = {}
 
     @property
-    def _projection_dim(self):
-        return int(self._get_backbone().M)
+    def _gate_feature_dim(self):
+        return int(self._get_backbone().embed_dim)
 
     def incremental_train(self, data_manager):
         self._cur_task += 1
@@ -130,9 +130,9 @@ class Learner(BaseLearner):
         backbone_train_seconds = time.perf_counter() - backbone_train_start
         self._save_tosca()
 
-        stats_start = time.perf_counter()
-        self._collect_current_task_statistics()
-        stats_seconds = time.perf_counter() - stats_start
+        feature_collection_start = time.perf_counter()
+        self._collect_current_task_gate_features()
+        feature_collection_seconds = time.perf_counter() - feature_collection_start
         gate_train_start = time.perf_counter()
         self._train_gate()
         gate_train_seconds = time.perf_counter() - gate_train_start
@@ -144,16 +144,16 @@ class Learner(BaseLearner):
 
         self._latest_task_timing = {
             "backbone_train_seconds": backbone_train_seconds,
-            "stats_collection_seconds": stats_seconds,
+            "feature_collection_seconds": feature_collection_seconds,
             "gate_train_seconds": gate_train_seconds,
             "replace_fc_seconds": replace_fc_seconds,
             "task_train_seconds": task_train_seconds,
         }
         logging.info(
-            "Task {} timing => backbone_train {:.2f}s, stats {:.2f}s, gate_train {:.2f}s, replace_fc {:.2f}s, total_train {:.2f}s".format(
+            "Task {} timing => backbone_train {:.2f}s, feature_collection {:.2f}s, gate_train {:.2f}s, replace_fc {:.2f}s, total_train {:.2f}s".format(
                 self._cur_task,
                 backbone_train_seconds,
-                stats_seconds,
+                feature_collection_seconds,
                 gate_train_seconds,
                 replace_fc_seconds,
                 task_train_seconds,
@@ -189,53 +189,88 @@ class Learner(BaseLearner):
             features = F.normalize(features, p=2, dim=1)
         return features
 
-    def _project_features(self, features):
-        backbone = self._get_backbone()
-        return torch.relu(features @ backbone.W_rand)
+    def _gate_features_per_class(self):
+        return int(self.args.get("gate_features_per_class", 200))
 
-    def _collect_current_task_statistics(self):
+    def _subsample_gate_features_per_class(self, features, labels):
+        features_per_class = self._gate_features_per_class()
+        if features_per_class <= 0:
+            return features, labels
+
+        selected_indices = []
+        for class_id in labels.unique(sorted=True):
+            class_indices = (labels == class_id).nonzero(as_tuple=False).squeeze(1)
+            if class_indices.numel() > features_per_class:
+                keep = torch.randperm(class_indices.numel())[:features_per_class]
+                class_indices = class_indices[keep]
+            selected_indices.append(class_indices)
+
+        if len(selected_indices) == 0:
+            return features, labels
+
+        selected_indices = torch.cat(selected_indices, dim=0)
+        return features[selected_indices], labels[selected_indices]
+
+    def _collect_current_task_gate_features(self):
         self._network.eval()
-        collector = FeatureStatsCollector(
-            feature_dim=self._projection_dim,
-            min_variance=self.args.get("gate_min_variance", 1e-6),
-            stats_mode=self.args.get("gate_stats_mode", "diag"),
-        )
+        feature_list = []
+        label_list = []
 
         with torch.no_grad():
             for _, data, label in self.train_loader_for_protonet:
                 data = data.to(self._device)
+                label = label.long()
                 features = self._extract_backbone_features(data)
                 features = self._prepare_gate_features(features)
-                features = self._project_features(features)
-                collector.update(features, label)
+                feature_list.append(features.cpu().float())
+                label_list.append(label.cpu())
 
-        class_stats = collector.compute_mean_variance()
-        self._task_feature_stats[self._cur_task] = class_stats
-
-    def _collect_all_synthetic_features(self):
-        synthetic_per_class = int(self.args.get("gate_synthetic_per_class", 200))
-        min_variance = self.args.get("gate_min_variance", 1e-6)
-
-        all_features, all_targets = [], []
-        for task_idx in range(self._cur_task + 1):
-            class_stats = self._task_feature_stats.get(task_idx, {})
-            sampled_features, _ = generate_samples(
-                class_stats,
-                n_samples=synthetic_per_class,
-                min_variance=min_variance,
-                device="cpu",
+        if len(feature_list) == 0:
+            self._task_feature_memory[self._cur_task] = {
+                "features": torch.empty(0, self._gate_feature_dim),
+                "labels": torch.empty(0, dtype=torch.long),
+            }
+            logging.warning(
+                "No real features available for gate memory on task %s.",
+                self._cur_task,
             )
-            if sampled_features.numel() == 0:
+            return
+
+        features = torch.cat(feature_list, dim=0)
+        labels = torch.cat(label_list, dim=0)
+        features, labels = self._subsample_gate_features_per_class(features, labels)
+
+        self._task_feature_memory[self._cur_task] = {
+            "features": features,
+            "labels": labels,
+        }
+        logging.info(
+            "Stored %s real gate features for task %s (%s per class cap).",
+            features.size(0),
+            self._cur_task,
+            self._gate_features_per_class(),
+        )
+
+    def _collect_all_gate_features(self):
+        all_features = []
+        all_targets = []
+        for task_idx in range(self._cur_task + 1):
+            task_memory = self._task_feature_memory.get(task_idx)
+            if task_memory is None:
+                continue
+
+            features = task_memory["features"]
+            if features.numel() == 0:
                 continue
             task_targets = torch.full(
-                (sampled_features.size(0),), task_idx, dtype=torch.long
+                (features.size(0),), task_idx, dtype=torch.long
             )
-            all_features.append(sampled_features)
+            all_features.append(features)
             all_targets.append(task_targets)
 
         if len(all_features) == 0:
             return (
-                torch.empty(0, self._projection_dim),
+                torch.empty(0, self._gate_feature_dim),
                 torch.empty(0, dtype=torch.long),
             )
 
@@ -245,7 +280,7 @@ class Learner(BaseLearner):
         num_tasks = self._cur_task + 1
         if self._gate is None:
             self._gate = TaskGate(
-                input_dim=self._projection_dim,
+                input_dim=self._gate_feature_dim,
                 num_tasks=num_tasks,
                 hidden_dim=int(self.args.get("gate_hidden_dim", 0)),
             ).to(self._device)
@@ -256,10 +291,10 @@ class Learner(BaseLearner):
     def _train_gate(self):
         self._init_or_extend_gate()
 
-        train_x, train_y = self._collect_all_synthetic_features()
+        train_x, train_y = self._collect_all_gate_features()
 
         if train_x.numel() == 0:
-            logging.warning("No synthetic features available for gate training.")
+            logging.warning("No real features available for gate training.")
             return
 
         gate_batch_size = int(self.args.get("gate_batch_size", 256))
@@ -328,7 +363,7 @@ class Learner(BaseLearner):
             {
                 "state_dict": self._gate.state_dict(),
                 "num_tasks": self._cur_task + 1,
-                "input_dim": self._projection_dim,
+                "input_dim": self._gate_feature_dim,
                 "hidden_dim": int(self.args.get("gate_hidden_dim", 0)),
             },
             path,
@@ -344,7 +379,6 @@ class Learner(BaseLearner):
         self._gate.eval()
         features = self._extract_backbone_features(inputs)
         features = self._prepare_gate_features(features)
-        features = self._project_features(features)
         gate_logits = self._gate(features)
         chosen_task = torch.argmax(gate_logits, dim=1)
 
@@ -448,7 +482,6 @@ class Learner(BaseLearner):
 
                 features = self._extract_backbone_features(inputs)
                 features = self._prepare_gate_features(features)
-                features = self._project_features(features)
                 gate_logits = self._gate(features)
                 chosen_task = torch.argmax(gate_logits, dim=1).cpu()
 
@@ -477,27 +510,18 @@ class Learner(BaseLearner):
         return {"top1": gate_acc, "per_task": per_task}
 
     def _compute_gate_routing_flops(self, batch_size=1):
-        input_dim = int(self._network.feature_dim)
-        projection_dim = int(self._projection_dim)
+        input_dim = int(self._gate_feature_dim)
         hidden_dim = int(self.args.get("gate_hidden_dim", 0))
         num_tasks = max(self._cur_task + 1, 1)
 
-        projection_flops = 2 * input_dim * projection_dim
-        relu_projection_flops = projection_dim
-
         if hidden_dim > 0:
-            hidden_flops = 2 * projection_dim * hidden_dim + hidden_dim
+            hidden_flops = 2 * input_dim * hidden_dim + hidden_dim
             classifier_flops = 2 * hidden_dim * num_tasks
         else:
             hidden_flops = 0
-            classifier_flops = 2 * projection_dim * num_tasks
+            classifier_flops = 2 * input_dim * num_tasks
 
-        per_sample_flops = (
-            projection_flops
-            + relu_projection_flops
-            + hidden_flops
-            + classifier_flops
-        )
+        per_sample_flops = hidden_flops + classifier_flops
         return {
             "per_sample": int(per_sample_flops),
             "per_batch": int(per_sample_flops * batch_size),
