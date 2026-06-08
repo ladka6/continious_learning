@@ -106,13 +106,21 @@ def _train(args):
                         routing_comparison["gate"]["grouped"]
                     )
                 )
+                logging.info(
+                    "CNN (ORACLE ROUTING): {}".format(
+                        routing_comparison["oracle"]["grouped"]
+                    )
+                )
                 entropy_top1 = routing_comparison["entropy"]["top1"]
                 gate_top1 = routing_comparison["gate"]["top1"]
+                oracle_top1 = routing_comparison["oracle"]["top1"]
                 logging.info("=" * 70)
                 logging.info("FINAL CNN COMPARISON after Task {}".format(task))
                 logging.info("Entropy routing top1: {:.2f}".format(entropy_top1))
                 logging.info("Gate routing top1   : {:.2f}".format(gate_top1))
+                logging.info("Oracle routing top1 : {:.2f}".format(oracle_top1))
                 logging.info("Delta (gate-entropy): {:+.2f}".format(gate_top1 - entropy_top1))
+                logging.info("Delta (oracle-gate) : {:+.2f}".format(oracle_top1 - gate_top1))
                 logging.info("=" * 70)
             logging.info("NME: {}".format(nme_accy["grouped"]))
 
@@ -159,13 +167,21 @@ def _train(args):
                         routing_comparison["gate"]["grouped"]
                     )
                 )
+                logging.info(
+                    "CNN (ORACLE ROUTING): {}".format(
+                        routing_comparison["oracle"]["grouped"]
+                    )
+                )
                 entropy_top1 = routing_comparison["entropy"]["top1"]
                 gate_top1 = routing_comparison["gate"]["top1"]
+                oracle_top1 = routing_comparison["oracle"]["top1"]
                 logging.info("=" * 70)
                 logging.info("FINAL CNN COMPARISON after Task {}".format(task))
                 logging.info("Entropy routing top1: {:.2f}".format(entropy_top1))
                 logging.info("Gate routing top1   : {:.2f}".format(gate_top1))
+                logging.info("Oracle routing top1 : {:.2f}".format(oracle_top1))
                 logging.info("Delta (gate-entropy): {:+.2f}".format(gate_top1 - entropy_top1))
+                logging.info("Delta (oracle-gate) : {:+.2f}".format(oracle_top1 - gate_top1))
                 logging.info("=" * 70)
 
             cnn_keys = [key for key in cnn_accy["grouped"].keys() if '-' in key]
