@@ -283,6 +283,7 @@ class Learner(BaseLearner):
                 input_dim=self._gate_feature_dim,
                 num_tasks=num_tasks,
                 hidden_dim=int(self.args.get("gate_hidden_dim", 0)),
+                dropout=float(self.args.get("gate_dropout", 0.0)),
             ).to(self._device)
         else:
             self._gate.extend(num_tasks)
@@ -365,17 +366,11 @@ class Learner(BaseLearner):
                 "num_tasks": self._cur_task + 1,
                 "input_dim": self._gate_feature_dim,
                 "hidden_dim": int(self.args.get("gate_hidden_dim", 0)),
+                "dropout": float(self.args.get("gate_dropout", 0.0)),
             },
             path,
         )
         logging.info(f"Gate parameters saved to {path}.")
-
-    def _targets_to_task_ids(self, targets):
-        task_ids = torch.zeros_like(targets, dtype=torch.long)
-        for task_idx, (start, end) in enumerate(self._task_ranges):
-            mask = (targets >= start) & (targets < end)
-            task_ids[mask] = task_idx
-        return task_ids
 
     def _classify_features_with_task_tosca(self, vit_features, task_ids):
         batch_size = vit_features.size(0)
@@ -407,31 +402,6 @@ class Learner(BaseLearner):
         chosen_task = torch.argmax(gate_logits, dim=1)
 
         return self._classify_features_with_task_tosca(vit_features, chosen_task)
-
-    def _get_entropy_routed_logits(self, inputs):
-        vit_features = self._extract_backbone_features(inputs)
-        all_logits = []
-        all_entropies = []
-
-        for task_idx in range(self._cur_task + 1):
-            self._load_tosca(task_idx)
-            task_features = self._get_backbone().forward_tosca(vit_features)
-            logits = self._network.fc(task_features)["logits"]
-            all_logits.append(logits)
-            probs = F.softmax(logits, dim=1)
-            entropy = -torch.sum(probs * torch.log(probs + 1e-9), dim=1)
-            all_entropies.append(entropy)
-
-        entropies = torch.stack(all_entropies, dim=0)
-        logits = torch.stack(all_logits, dim=0)
-        chosen_task = torch.argmin(entropies, dim=0)
-        batch_indices = torch.arange(inputs.size(0), device=inputs.device)
-        return logits[chosen_task, batch_indices]
-
-    def _get_oracle_routed_logits(self, inputs, targets):
-        vit_features = self._extract_backbone_features(inputs)
-        task_ids = self._targets_to_task_ids(targets)
-        return self._classify_features_with_task_tosca(vit_features, task_ids)
 
     def after_task(self):
         self._network.backbone.reset_tosca()
@@ -601,45 +571,6 @@ class Learner(BaseLearner):
             y_true.append(targets.cpu().numpy())
 
         return np.concatenate(y_pred), np.concatenate(y_true)
-
-    def _eval_cnn_with_routing(self, loader, routing_mode):
-        self._network.eval()
-        y_pred, y_true = [], []
-
-        for _, (_, inputs, targets) in enumerate(loader):
-            inputs = inputs.to(self._device)
-            targets = targets.long().to(self._device)
-            with torch.no_grad():
-                if routing_mode == "gate":
-                    outputs = self._get_gate_routed_logits(inputs)
-                elif routing_mode == "entropy":
-                    outputs = self._get_entropy_routed_logits(inputs)
-                elif routing_mode == "oracle":
-                    outputs = self._get_oracle_routed_logits(inputs, targets)
-                else:
-                    raise ValueError(f"Unknown routing mode: {routing_mode}")
-
-            predicts = torch.topk(
-                outputs,
-                k=self.topk,
-                dim=1,
-                largest=True,
-                sorted=True,
-            )[1]
-            y_pred.append(predicts.cpu().numpy())
-            y_true.append(targets.cpu().numpy())
-
-        return np.concatenate(y_pred), np.concatenate(y_true)
-
-    def eval_routing_comparison(self):
-        comparison = {}
-        for routing_mode in ("gate", "entropy", "oracle"):
-            y_pred, y_true = self._eval_cnn_with_routing(
-                self.test_loader,
-                routing_mode,
-            )
-            comparison[routing_mode] = self._evaluate(y_pred, y_true)
-        return comparison
 
     def _save_tosca(self):
         path = f"tosca/task{self._cur_task}.pth"

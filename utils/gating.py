@@ -113,15 +113,19 @@ def generate_samples(class_stats, n_samples, min_variance=1e-6, device="cpu"):
 
 
 class TaskGate(nn.Module):
-    def __init__(self, input_dim, num_tasks=1, hidden_dim=0):
+    def __init__(self, input_dim, num_tasks=1, hidden_dim=0, dropout=0.0):
         super().__init__()
         self.hidden_dim = hidden_dim
+        self.dropout = dropout
 
         if hidden_dim > 0:
-            self.backbone = nn.Sequential(
+            layers = [
                 nn.Linear(input_dim, hidden_dim),
                 nn.ReLU(inplace=True),
-            )
+            ]
+            if dropout > 0:
+                layers.append(nn.Dropout(p=dropout))
+            self.backbone = nn.Sequential(*layers)
             classifier_in_dim = hidden_dim
         else:
             self.backbone = nn.Identity()

@@ -143,6 +143,7 @@ class Learner(BaseLearner):
                 input_dim=self._network.backbone.embed_dim,
                 num_tasks=num_tasks,
                 hidden_dim=int(self.args.get("gate_hidden_dim", 0)),
+                dropout=float(self.args.get("gate_dropout", 0.0)),
             ).to(self._device)
         else:
             self._gate.extend(num_tasks)
@@ -252,6 +253,7 @@ class Learner(BaseLearner):
                 "num_tasks": self._cur_task + 1,
                 "input_dim": self._network.backbone.embed_dim,
                 "hidden_dim": int(self.args.get("gate_hidden_dim", 0)),
+                "dropout": float(self.args.get("gate_dropout", 0.0)),
             },
             path,
         )
