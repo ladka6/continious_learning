@@ -8,7 +8,7 @@ from torch.nn import functional as F
 from torch.utils.data import DataLoader, TensorDataset
 
 from utils.gating import TaskGate
-from utils.inc_net import SimpleAdaptiveVitNet
+from utils.inc_net import SimpleVitNet
 from models.base import BaseLearner
 from utils.toolkit import tensor2numpy
 
@@ -18,7 +18,7 @@ num_workers = 10
 class Learner(BaseLearner):
     def __init__(self, args):
         super().__init__(args)
-        self._network = SimpleAdaptiveVitNet(args, True)
+        self._network = SimpleVitNet(args, True)
         self.args = args
 
         # Task boundaries: task_ranges[i] = (start_class, end_class)
@@ -31,7 +31,7 @@ class Learner(BaseLearner):
 
     @property
     def _gate_feature_dim(self):
-        return int(self._get_backbone().embed_dim)
+        return int(self._network.feature_dim)
 
     def incremental_train(self, data_manager):
         self._cur_task += 1
@@ -167,7 +167,7 @@ class Learner(BaseLearner):
 
     def _set_trainable(self):
         # Adapters trainable on task 0 only, frozen afterwards.
-        # W_rand always frozen. Tosca + fc trainable every task.
+        # Tosca + fc trainable every task.
         for p in self._network.parameters():
             p.requires_grad = False
         backbone = self._get_backbone()
@@ -377,9 +377,9 @@ class Learner(BaseLearner):
             )
 
         self._gate.eval()
-        features = self._extract_backbone_features(inputs)
-        features = self._prepare_gate_features(features)
-        gate_logits = self._gate(features)
+        vit_features = self._extract_backbone_features(inputs)
+        gate_features = self._prepare_gate_features(vit_features)
+        gate_logits = self._gate(gate_features)
         chosen_task = torch.argmax(gate_logits, dim=1)
 
         batch_size = inputs.size(0)
@@ -389,7 +389,8 @@ class Learner(BaseLearner):
         for t in chosen_task.unique().tolist():
             mask = chosen_task == t
             self._load_tosca(int(t))
-            out_logits[mask] = self._network(inputs[mask])["logits"]
+            task_features = self._get_backbone().forward_tosca(vit_features[mask])
+            out_logits[mask] = self._network.fc(task_features)["logits"]
 
         return out_logits
 

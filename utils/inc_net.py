@@ -13,7 +13,6 @@ def get_backbone(args, pretrained=False):
     ):
         ffn_num = args["ffn_num"]
         from backbone import vit_adapter
-        from backbone import adaptive_tosca
         from easydict import EasyDict
         tuning_config = EasyDict(
                     # AdaptFormer
@@ -31,15 +30,25 @@ def get_backbone(args, pretrained=False):
         if name == "pretrained_vit_b16_224_adapter" or name == "vit_b16_224_adapter":
             model = vit_adapter.vit_base_patch16_224_adapter(num_classes=0,
                         global_pool=False, drop_path_rate=0.0, tuning_config=tuning_config)
-            
-            model = adaptive_tosca.ToscaAdaptiveViT(model, args["mlp_ratio"], args["se_ratio"], args['flow'], args['M'])
+
+            if type == "adaptive_gating_tosca":
+                from backbone import adaptive_tosca
+                model = adaptive_tosca.ToscaAdaptiveViT(model, args["mlp_ratio"], args["se_ratio"], args['flow'], args['M'])
+            else:
+                from backbone import vit_tosca
+                model = vit_tosca.ToscaViT(model, args["mlp_ratio"], args["se_ratio"], args["flow"])
             model.out_dim=768
             return model.eval()
         elif name == "pretrained_vit_b16_224_in21k_adapter" or name == "vit_b16_224_in21k_adapter":
             model = vit_adapter.vit_base_patch16_224_in21k_adapter(num_classes=0,
                         global_pool=False, drop_path_rate=0.0, tuning_config=tuning_config)
-        
-            model = adaptive_tosca.ToscaAdaptiveViT(model, args["mlp_ratio"], args["se_ratio"], args['flow'], args['M'])
+
+            if type == "adaptive_gating_tosca":
+                from backbone import adaptive_tosca
+                model = adaptive_tosca.ToscaAdaptiveViT(model, args["mlp_ratio"], args["se_ratio"], args['flow'], args['M'])
+            else:
+                from backbone import vit_tosca
+                model = vit_tosca.ToscaViT(model, args["mlp_ratio"], args["se_ratio"], args["flow"])
             model.out_dim=768
             return model.eval()
         else:

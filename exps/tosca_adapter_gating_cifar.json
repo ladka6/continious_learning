@@ -15,7 +15,6 @@
   "se_ratio": 16,
   "l1": 0.0005,
   "flow": "tosca",
-  "M": 5000,
   "ffn_num": 64,
 
   "epochs": 20,
