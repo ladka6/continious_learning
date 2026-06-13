@@ -7,7 +7,12 @@ from torch import optim
 from torch.nn import functional as F
 from torch.utils.data import DataLoader, TensorDataset
 
-from utils.gating import TaskGate, FeatureStatsCollector, generate_samples
+from utils.gating import (
+    TaskGate,
+    PositionalMoEHead,
+    FeatureStatsCollector,
+    generate_samples,
+)
 from utils.inc_net import SimpleVitNet
 from models.base import BaseLearner
 from utils.toolkit import tensor2numpy
@@ -26,10 +31,17 @@ class Learner(BaseLearner):
 
         # Gate components
         self._gate = None
-        # task_id -> {class_id: {"mean", "covariance", "count"}}
+        # task_id -> {class_id: {"mean", "covariance", "count"}} on L2-normalized
+        # features (used to train/route the gate).
         self._task_feature_stats = {}
+        # Same, but on raw (pre-L2-normalize) features. The toscas are trained on
+        # raw features, so head replay must be drawn from these.
+        self._task_raw_feature_stats = {}
         self._latest_task_timing = {}
         self._moe_top_k = int(self.args.get("moe_top_k", 1))
+
+        # Joint classifier over concatenated top-k expert features.
+        self._moe_head = None
 
     @property
     def _gate_feature_dim(self):
@@ -140,6 +152,10 @@ class Learner(BaseLearner):
         self._train_gate()
         gate_train_seconds = time.perf_counter() - gate_train_start
 
+        moe_head_train_start = time.perf_counter()
+        self._train_moe_head()
+        moe_head_train_seconds = time.perf_counter() - moe_head_train_start
+
         replace_fc_start = time.perf_counter()
         self.replace_fc()
         replace_fc_seconds = time.perf_counter() - replace_fc_start
@@ -149,15 +165,17 @@ class Learner(BaseLearner):
             "backbone_train_seconds": backbone_train_seconds,
             "feature_collection_seconds": feature_collection_seconds,
             "gate_train_seconds": gate_train_seconds,
+            "moe_head_train_seconds": moe_head_train_seconds,
             "replace_fc_seconds": replace_fc_seconds,
             "task_train_seconds": task_train_seconds,
         }
         logging.info(
-            "Task {} timing => backbone_train {:.2f}s, feature_collection {:.2f}s, gate_train {:.2f}s, replace_fc {:.2f}s, total_train {:.2f}s".format(
+            "Task {} timing => backbone_train {:.2f}s, feature_collection {:.2f}s, gate_train {:.2f}s, moe_head_train {:.2f}s, replace_fc {:.2f}s, total_train {:.2f}s".format(
                 self._cur_task,
                 backbone_train_seconds,
                 feature_collection_seconds,
                 gate_train_seconds,
+                moe_head_train_seconds,
                 replace_fc_seconds,
                 task_train_seconds,
             )
@@ -198,6 +216,16 @@ class Learner(BaseLearner):
     def _gate_min_variance(self):
         return float(self.args.get("gate_min_variance", 1e-6))
 
+    def _moe_stats_mode(self):
+        return str(self.args.get("moe_stats_mode", "covariance"))
+
+    def _moe_synthetic_per_class(self):
+        return int(self.args.get("moe_synthetic_per_class", self._synthetic_per_class()))
+
+    def _classes_per_task(self):
+        start, end = self._task_ranges[0]
+        return end - start
+
     def _collect_current_task_gate_stats(self):
         """Store per-class mean + full covariance of real ViT features for the
         current task. The gate is later trained on synthetic samples drawn from
@@ -208,16 +236,25 @@ class Learner(BaseLearner):
             min_variance=self._gate_min_variance(),
             stats_mode="covariance",
         )
+        raw_collector = FeatureStatsCollector(
+            feature_dim=self._gate_feature_dim,
+            min_variance=self._gate_min_variance(),
+            stats_mode=self._moe_stats_mode(),
+        )
         with torch.no_grad():
             for _, data, label in self.train_loader_for_protonet:
                 data = data.to(self._device)
                 label = label.long()
                 features = self._extract_backbone_features(data)
-                features = self._prepare_gate_features(features)
-                collector.update(features, label)
+                raw_collector.update(features, label)
+                norm_features = self._prepare_gate_features(features)
+                collector.update(norm_features, label)
 
         class_stats = collector.compute_mean_variance()
         self._task_feature_stats[self._cur_task] = class_stats
+        self._task_raw_feature_stats[self._cur_task] = (
+            raw_collector.compute_mean_variance()
+        )
         logging.info(
             "Stored full-covariance gate stats for task %s (%s classes).",
             self._cur_task,
@@ -358,44 +395,261 @@ class Learner(BaseLearner):
         )
         logging.info(f"Gate parameters saved to {path}.")
 
+    def _generate_head_replay_raw(self):
+        """Synthetic raw (pre-normalize) ViT features for every class seen so
+        far, labeled by GLOBAL class id, drawn from the stored per-class
+        Gaussians. These are pushed through the toscas to train the head."""
+        n_samples = self._moe_synthetic_per_class()
+        min_variance = self._gate_min_variance()
+
+        all_features = []
+        all_labels = []
+        for task_idx in range(self._cur_task + 1):
+            class_stats = self._task_raw_feature_stats.get(task_idx)
+            if not class_stats:
+                continue
+            feats, labels = generate_samples(
+                class_stats,
+                n_samples=n_samples,
+                min_variance=min_variance,
+                device="cpu",
+            )
+            if feats.numel() == 0:
+                continue
+            all_features.append(feats)
+            all_labels.append(labels)
+
+        if len(all_features) == 0:
+            return (
+                torch.empty(0, self._gate_feature_dim),
+                torch.empty(0, dtype=torch.long),
+            )
+        return torch.cat(all_features, dim=0), torch.cat(all_labels, dim=0)
+
+    def _build_moe_training_tensors(self):
+        """Turn replayed raw features into (concatenated expert features,
+        positional target) pairs for head training. The gate (frozen) picks the
+        top-k experts per sample; each selected tosca produces that sample's
+        slot feature; the target is the slot+local-class index of the sample's
+        true task (ignored when the true task is not in the top-k)."""
+        raw_x, class_y = self._generate_head_replay_raw()
+        if raw_x.numel() == 0:
+            return None
+
+        num_tasks = self._cur_task + 1
+        top_k = self._moe_top_k
+        eff_k = max(1, min(top_k, num_tasks))
+        inc = self._classes_per_task()
+        feature_dim = self._gate_feature_dim
+        n = raw_x.size(0)
+        chunk = 4096
+
+        starts = torch.tensor([s for s, _ in self._task_ranges])
+        true_task = torch.zeros(n, dtype=torch.long)
+        for t, (start, end) in enumerate(self._task_ranges):
+            true_task[(class_y >= start) & (class_y < end)] = t
+
+        assert self._gate is not None
+        self._gate.eval()
+        raw_x_dev = raw_x.to(self._device)
+
+        # Frozen-gate top-k routing for every replay sample.
+        topk_chunks = []
+        with torch.no_grad():
+            for i in range(0, n, chunk):
+                xb = raw_x_dev[i : i + chunk]
+                gate_logits = self._gate(self._prepare_gate_features(xb))
+                topk_chunks.append(torch.topk(gate_logits, eff_k, dim=1).indices.cpu())
+        topk_tasks = torch.cat(topk_chunks, dim=0)  # [N, eff_k]
+
+        # Per-sample slot features. Load each tosca once, fill the slots that
+        # selected it. Slots >= eff_k stay zero-padded.
+        slot_feats = torch.zeros(n, top_k, feature_dim)
+        with torch.no_grad():
+            for t in range(num_tasks):
+                sel = topk_tasks == t  # [N, eff_k]
+                rows = sel.any(dim=1)
+                if not rows.any():
+                    continue
+                self._load_tosca(t)
+                idx = rows.nonzero(as_tuple=True)[0]
+                ft_full = torch.zeros(n, feature_dim)
+                for i in range(0, idx.numel(), chunk):
+                    rows_chunk = idx[i : i + chunk]
+                    ft_full[rows_chunk] = (
+                        self._get_backbone()
+                        .forward_tosca(raw_x_dev[rows_chunk])
+                        .cpu()
+                    )
+                for s in range(eff_k):
+                    slot_mask = sel[:, s]
+                    if slot_mask.any():
+                        slot_feats[slot_mask, s, :] = ft_full[slot_mask]
+
+        match = topk_tasks == true_task.unsqueeze(1)  # [N, eff_k]
+        has_true = match.any(dim=1)
+        slot_idx = torch.argmax(match.int(), dim=1)  # first matching slot
+        local_class = class_y - starts[true_task]
+        target = slot_idx * inc + local_class
+        target[~has_true] = -100  # unrecoverable: true task not routed
+
+        return slot_feats.reshape(n, top_k * feature_dim), target, has_true
+
+    def _train_moe_head(self):
+        num_tasks = self._cur_task + 1
+        top_k = self._moe_top_k
+        inc = self._classes_per_task()
+        feature_dim = self._gate_feature_dim
+
+        if self._moe_head is None:
+            self._moe_head = PositionalMoEHead(
+                feature_dim=feature_dim,
+                top_k=top_k,
+                classes_per_task=inc,
+                hidden_dim=int(self.args.get("moe_hidden_dim", 1024)),
+                dropout=float(self.args.get("moe_dropout", 0.1)),
+            ).to(self._device)
+
+        tensors = self._build_moe_training_tensors()
+        if tensors is None:
+            logging.warning("No replay features available for MoE head training.")
+            return
+        train_x, train_y, has_true = tensors
+
+        coverage = 100.0 * has_true.float().mean().item()
+        logging.info(
+            "MoE head Task %s: %d replay samples, true task routed in top-%d for %.2f%%.",
+            self._cur_task,
+            train_x.size(0),
+            max(1, min(top_k, num_tasks)),
+            coverage,
+        )
+
+        dataset = TensorDataset(train_x, train_y)
+        loader = DataLoader(
+            dataset,
+            batch_size=int(self.args.get("moe_batch_size", 512)),
+            shuffle=True,
+            num_workers=0,
+        )
+
+        optimizer = optim.Adam(
+            self._moe_head.parameters(),
+            lr=float(self.args.get("moe_lr", 1e-3)),
+            weight_decay=float(self.args.get("moe_weight_decay", 1e-4)),
+        )
+        criterion = torch.nn.CrossEntropyLoss(ignore_index=-100)
+        epochs = int(self.args.get("moe_epochs", 30))
+
+        self._moe_head.train()
+        for epoch in range(epochs):
+            epoch_loss = 0.0
+            correct = 0
+            total = 0
+            for features, targets in loader:
+                features = features.to(self._device)
+                targets = targets.to(self._device)
+
+                optimizer.zero_grad()
+                logits = self._moe_head(features)
+                loss = criterion(logits, targets)
+                loss.backward()
+                optimizer.step()
+
+                epoch_loss += loss.item()
+                valid = targets != -100
+                if valid.any():
+                    preds = torch.argmax(logits, dim=1)
+                    correct += (preds[valid] == targets[valid]).sum().item()
+                    total += int(valid.sum().item())
+
+            avg_loss = epoch_loss / max(len(loader), 1)
+            train_acc = 100.0 * correct / total if total > 0 else 0.0
+            logging.info(
+                f"MoE Head Task {self._cur_task}, Epoch {epoch + 1}/{epochs} => "
+                f"Loss {avg_loss:.4f}, Train_accy {train_acc:.2f}"
+            )
+
+        self._moe_head.eval()
+        self._save_moe_head()
+
+    def _save_moe_head(self):
+        if self._moe_head is None:
+            return
+        path = f"tosca/moe_head_task{self._cur_task}.pth"
+        torch.save(
+            {
+                "state_dict": self._moe_head.state_dict(),
+                "feature_dim": self._gate_feature_dim,
+                "top_k": self._moe_top_k,
+                "classes_per_task": self._classes_per_task(),
+                "hidden_dim": int(self.args.get("moe_hidden_dim", 1024)),
+                "dropout": float(self.args.get("moe_dropout", 0.1)),
+            },
+            path,
+        )
+        logging.info(f"MoE head parameters saved to {path}.")
+
     def _get_moe_routed_logits(self, inputs):
-        """Top-k mixture-of-experts routing. The gate selects the top-k tasks
-        per sample; each selected task's tosca head scores ONLY its own classes
-        (cosine logits via CosineLinear), and the per-task own-class scores are
-        concatenated over the union of the selected tasks' classes. argmax over
-        that union is the prediction. k = moe_top_k (k=1 -> single-task routing,
-        still restricted to the chosen task's own classes)."""
+        """Top-k mixture-of-experts routing with a JOINT head. The gate selects
+        the top-k tasks per sample; each selected task's tosca produces that
+        sample's slot feature; the slot features are concatenated (gate-rank
+        order, zero-padded) and a single PositionalMoEHead scores them jointly.
+        The head's per-slot class scores are scattered back to the selected
+        tasks' (disjoint) global class blocks, and argmax over that union is the
+        prediction. k = moe_top_k."""
         if self._gate is None or self._gate.num_tasks < (self._cur_task + 1):
             raise RuntimeError(
                 "Gate is not initialized or out of sync with current task count."
             )
+        if self._moe_head is None:
+            raise RuntimeError("MoE head is not initialized.")
 
         self._gate.eval()
+        self._moe_head.eval()
         vit_features = self._extract_backbone_features(inputs)
         gate_features = self._prepare_gate_features(vit_features)
         gate_logits = self._gate(gate_features)
 
         num_tasks = self._cur_task + 1
-        k = max(1, min(self._moe_top_k, num_tasks))
-        topk_tasks = torch.topk(gate_logits, k, dim=1).indices  # [B, k]
-
+        top_k = self._moe_top_k
+        eff_k = max(1, min(top_k, num_tasks))
+        inc = self._classes_per_task()
+        feature_dim = self._gate_feature_dim
         batch_size = inputs.size(0)
+        topk_tasks = torch.topk(gate_logits, eff_k, dim=1).indices  # [B, eff_k]
+
+        # Build the [B, top_k, D] concatenated expert features (zero-padded).
+        slot_feats = torch.zeros(
+            batch_size, top_k, feature_dim, device=inputs.device
+        )
+        for task_idx in torch.unique(topk_tasks).tolist():
+            task_idx = int(task_idx)
+            sel = topk_tasks == task_idx  # [B, eff_k]
+            self._load_tosca(task_idx)
+            task_features = self._get_backbone().forward_tosca(vit_features)
+            for s in range(eff_k):
+                slot_mask = sel[:, s]
+                if slot_mask.any():
+                    slot_feats[slot_mask, s, :] = task_features[slot_mask]
+
+        head_logits = self._moe_head(
+            slot_feats.reshape(batch_size, top_k * feature_dim)
+        ).view(batch_size, top_k, inc)
+
+        # Scatter each slot's class scores into its task's global class block.
         total_classes = self._network.fc.out_features
         out_logits = torch.full(
             (batch_size, total_classes), float("-inf"), device=inputs.device
         )
-
-        for task_idx in torch.unique(topk_tasks).tolist():
-            task_idx = int(task_idx)
-            mask = (topk_tasks == task_idx).any(
-                dim=1
-            )  # samples with this task in top-k
-            self._load_tosca(task_idx)
-            task_features = self._get_backbone().forward_tosca(vit_features[mask])
-            task_logits = self._network.fc(task_features)["logits"]
-            start, end = self._task_ranges[task_idx]
-            # disjoint class blocks across tasks -> no overwrite between experts
-            out_logits[mask, start:end] = task_logits[:, start:end]
+        starts = torch.tensor(
+            [s for s, _ in self._task_ranges], device=inputs.device
+        )
+        offsets = torch.arange(inc, device=inputs.device)
+        for s in range(eff_k):
+            block_start = starts[topk_tasks[:, s]]  # [B]
+            idx = block_start.unsqueeze(1) + offsets.unsqueeze(0)  # [B, inc]
+            out_logits.scatter_(1, idx, head_logits[:, s, :])
 
         return out_logits
 

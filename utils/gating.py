@@ -159,6 +159,41 @@ class TaskGate(nn.Module):
         x = self.backbone(x)
         return self.classifier(x)
 
+class PositionalMoEHead(nn.Module):
+    """Joint classifier over the concatenated top-k expert (tosca) features.
+
+    Input  : [B, top_k * feature_dim]  -- the selected experts' tosca outputs,
+             concatenated in gate-rank order (slot 0 = highest-scoring task).
+             Slots beyond the number of available tasks are zero-padded.
+    Output : [B, top_k * classes_per_task]  -- slot s, local class j scores the
+             j-th class of the task sitting in slot s. The caller scatters these
+             back to global class ids. Because the head sees every selected
+             expert at once, it scores them jointly (cross-expert calibration)
+             instead of independent per-expert cosine blocks.
+    """
+
+    def __init__(self, feature_dim, top_k, classes_per_task, hidden_dim=0, dropout=0.0):
+        super().__init__()
+        self.feature_dim = feature_dim
+        self.top_k = top_k
+        self.classes_per_task = classes_per_task
+
+        in_dim = feature_dim * top_k
+        out_dim = classes_per_task * top_k
+
+        if hidden_dim > 0:
+            layers = [nn.Linear(in_dim, hidden_dim), nn.ReLU(inplace=True)]
+            if dropout > 0:
+                layers.append(nn.Dropout(p=dropout))
+            layers.append(nn.Linear(hidden_dim, out_dim))
+            self.net = nn.Sequential(*layers)
+        else:
+            self.net = nn.Linear(in_dim, out_dim)
+
+    def forward(self, x):
+        return self.net(x)
+
+
 class TaskGateWithRandomProjection(nn.Module):
     def __init__(self, input_dim, num_tasks=1, hidden_dim=0, projection_dim=10000):
         super().__init__()
