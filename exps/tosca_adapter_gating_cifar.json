@@ -32,6 +32,9 @@
   "gate_lr": 0.001,
   "gate_weight_decay": 0.0,
   "gate_batch_size": 256,
-  "gate_features_per_class": 500,
-  "gate_normalize_features": true
+  "synthetic_per_class": 500,
+  "gate_min_variance": 1e-6,
+  "gate_normalize_features": true,
+
+  "moe_top_k": 2
 }

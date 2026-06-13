@@ -7,7 +7,7 @@ from torch import optim
 from torch.nn import functional as F
 from torch.utils.data import DataLoader, TensorDataset
 
-from utils.gating import TaskGate
+from utils.gating import TaskGate, FeatureStatsCollector, generate_samples
 from utils.inc_net import SimpleVitNet
 from models.base import BaseLearner
 from utils.toolkit import tensor2numpy
@@ -26,8 +26,10 @@ class Learner(BaseLearner):
 
         # Gate components
         self._gate = None
-        self._task_feature_memory = {}
+        # task_id -> {class_id: {"mean", "covariance", "count"}}
+        self._task_feature_stats = {}
         self._latest_task_timing = {}
+        self._moe_top_k = int(self.args.get("moe_top_k", 1))
 
     @property
     def _gate_feature_dim(self):
@@ -94,8 +96,9 @@ class Learner(BaseLearner):
             losses = 0.0
             correct, total = 0, 0
             for _, inputs, targets in self.train_loader:
-                inputs, targets = inputs.to(self._device), targets.long().to(
-                    self._device
+                inputs, targets = (
+                    inputs.to(self._device),
+                    targets.long().to(self._device),
                 )
 
                 optimizer.zero_grad()
@@ -118,12 +121,12 @@ class Learner(BaseLearner):
             train_acc = np.around(tensor2numpy(correct) * 100 / total, decimals=2)
 
             info = "Task {}, Epoch {}/{} => Loss {:.3f}, Train_accy {:.2f}".format(
-                    self._cur_task,
-                    epoch + 1,
-                    self.args["epochs"],
-                    losses / len(self.train_loader),
-                    train_acc,
-                )
+                self._cur_task,
+                epoch + 1,
+                self.args["epochs"],
+                losses / len(self.train_loader),
+                train_acc,
+            )
             prog_bar.set_description(info)
 
         logging.info(info)
@@ -131,7 +134,7 @@ class Learner(BaseLearner):
         self._save_tosca()
 
         feature_collection_start = time.perf_counter()
-        self._collect_current_task_gate_features()
+        self._collect_current_task_gate_stats()
         feature_collection_seconds = time.perf_counter() - feature_collection_start
         gate_train_start = time.perf_counter()
         self._train_gate()
@@ -189,83 +192,62 @@ class Learner(BaseLearner):
             features = F.normalize(features, p=2, dim=1)
         return features
 
-    def _gate_features_per_class(self):
-        return int(self.args.get("gate_features_per_class", 200))
+    def _synthetic_per_class(self):
+        return int(self.args.get("synthetic_per_class", 200))
 
-    def _subsample_gate_features_per_class(self, features, labels):
-        features_per_class = self._gate_features_per_class()
-        if features_per_class <= 0:
-            return features, labels
+    def _gate_min_variance(self):
+        return float(self.args.get("gate_min_variance", 1e-6))
 
-        selected_indices = []
-        for class_id in labels.unique(sorted=True):
-            class_indices = (labels == class_id).nonzero(as_tuple=False).squeeze(1)
-            if class_indices.numel() > features_per_class:
-                keep = torch.randperm(class_indices.numel())[:features_per_class]
-                class_indices = class_indices[keep]
-            selected_indices.append(class_indices)
-
-        if len(selected_indices) == 0:
-            return features, labels
-
-        selected_indices = torch.cat(selected_indices, dim=0)
-        return features[selected_indices], labels[selected_indices]
-
-    def _collect_current_task_gate_features(self):
+    def _collect_current_task_gate_stats(self):
+        """Store per-class mean + full covariance of real ViT features for the
+        current task. The gate is later trained on synthetic samples drawn from
+        these Gaussians; tosca heads keep training on real features."""
         self._network.eval()
-        feature_list = []
-        label_list = []
-
+        collector = FeatureStatsCollector(
+            feature_dim=self._gate_feature_dim,
+            min_variance=self._gate_min_variance(),
+            stats_mode="covariance",
+        )
         with torch.no_grad():
             for _, data, label in self.train_loader_for_protonet:
                 data = data.to(self._device)
                 label = label.long()
                 features = self._extract_backbone_features(data)
                 features = self._prepare_gate_features(features)
-                feature_list.append(features.cpu().float())
-                label_list.append(label.cpu())
+                collector.update(features, label)
 
-        if len(feature_list) == 0:
-            self._task_feature_memory[self._cur_task] = {
-                "features": torch.empty(0, self._gate_feature_dim),
-                "labels": torch.empty(0, dtype=torch.long),
-            }
-            logging.warning(
-                "No real features available for gate memory on task %s.",
-                self._cur_task,
-            )
-            return
-
-        features = torch.cat(feature_list, dim=0)
-        labels = torch.cat(label_list, dim=0)
-        features, labels = self._subsample_gate_features_per_class(features, labels)
-
-        self._task_feature_memory[self._cur_task] = {
-            "features": features,
-            "labels": labels,
-        }
+        class_stats = collector.compute_mean_variance()
+        self._task_feature_stats[self._cur_task] = class_stats
         logging.info(
-            "Stored %s real gate features for task %s (%s per class cap).",
-            features.size(0),
+            "Stored full-covariance gate stats for task %s (%s classes).",
             self._cur_task,
-            self._gate_features_per_class(),
+            len(class_stats),
         )
 
     def _collect_all_gate_features(self):
+        """Generate synthetic ViT features from every task's stored per-class
+        Gaussians, labeled by task id, for gate training."""
+        n_samples = self._synthetic_per_class()
+        min_variance = self._gate_min_variance()
+
         all_features = []
         all_targets = []
         for task_idx in range(self._cur_task + 1):
-            task_memory = self._task_feature_memory.get(task_idx)
-            if task_memory is None:
+            class_stats = self._task_feature_stats.get(task_idx)
+            if not class_stats:
                 continue
-
-            features = task_memory["features"]
-            if features.numel() == 0:
+            sampled_features, _ = generate_samples(
+                class_stats,
+                n_samples=n_samples,
+                min_variance=min_variance,
+                device="cpu",
+            )
+            if sampled_features.numel() == 0:
                 continue
             task_targets = torch.full(
-                (features.size(0),), task_idx, dtype=torch.long
+                (sampled_features.size(0),), task_idx, dtype=torch.long
             )
-            all_features.append(features)
+            all_features.append(sampled_features)
             all_targets.append(task_targets)
 
         if len(all_features) == 0:
@@ -295,7 +277,7 @@ class Learner(BaseLearner):
         train_x, train_y = self._collect_all_gate_features()
 
         if train_x.numel() == 0:
-            logging.warning("No real features available for gate training.")
+            logging.warning("No synthetic features available for gate training.")
             return
 
         gate_batch_size = int(self.args.get("gate_batch_size", 256))
@@ -313,12 +295,16 @@ class Learner(BaseLearner):
 
         assert self._gate is not None
         if self._gate.num_tasks < 2:
-            logging.info("Gate Task 0: single task, skipping training (nothing to discriminate).")
+            logging.info(
+                "Gate Task 0: single task, skipping training (nothing to discriminate)."
+            )
             self._gate.eval()
             self._save_gate()
             return
 
-        optimizer = optim.Adam(self._gate.parameters(), lr=gate_lr, weight_decay=gate_wd)
+        optimizer = optim.Adam(
+            self._gate.parameters(), lr=gate_lr, weight_decay=gate_wd
+        )
         criterion = torch.nn.CrossEntropyLoss()
 
         self._gate.train()
@@ -372,24 +358,13 @@ class Learner(BaseLearner):
         )
         logging.info(f"Gate parameters saved to {path}.")
 
-    def _classify_features_with_task_tosca(self, vit_features, task_ids):
-        batch_size = vit_features.size(0)
-        total_classes = self._network.fc.out_features
-        out_logits = torch.zeros(
-            batch_size,
-            total_classes,
-            device=vit_features.device,
-        )
-
-        for task_idx in task_ids.unique().tolist():
-            mask = task_ids == task_idx
-            self._load_tosca(int(task_idx))
-            task_features = self._get_backbone().forward_tosca(vit_features[mask])
-            out_logits[mask] = self._network.fc(task_features)["logits"]
-
-        return out_logits
-
-    def _get_gate_routed_logits(self, inputs):
+    def _get_moe_routed_logits(self, inputs):
+        """Top-k mixture-of-experts routing. The gate selects the top-k tasks
+        per sample; each selected task's tosca head scores ONLY its own classes
+        (cosine logits via CosineLinear), and the per-task own-class scores are
+        concatenated over the union of the selected tasks' classes. argmax over
+        that union is the prediction. k = moe_top_k (k=1 -> single-task routing,
+        still restricted to the chosen task's own classes)."""
         if self._gate is None or self._gate.num_tasks < (self._cur_task + 1):
             raise RuntimeError(
                 "Gate is not initialized or out of sync with current task count."
@@ -399,9 +374,30 @@ class Learner(BaseLearner):
         vit_features = self._extract_backbone_features(inputs)
         gate_features = self._prepare_gate_features(vit_features)
         gate_logits = self._gate(gate_features)
-        chosen_task = torch.argmax(gate_logits, dim=1)
 
-        return self._classify_features_with_task_tosca(vit_features, chosen_task)
+        num_tasks = self._cur_task + 1
+        k = max(1, min(self._moe_top_k, num_tasks))
+        topk_tasks = torch.topk(gate_logits, k, dim=1).indices  # [B, k]
+
+        batch_size = inputs.size(0)
+        total_classes = self._network.fc.out_features
+        out_logits = torch.full(
+            (batch_size, total_classes), float("-inf"), device=inputs.device
+        )
+
+        for task_idx in torch.unique(topk_tasks).tolist():
+            task_idx = int(task_idx)
+            mask = (topk_tasks == task_idx).any(
+                dim=1
+            )  # samples with this task in top-k
+            self._load_tosca(task_idx)
+            task_features = self._get_backbone().forward_tosca(vit_features[mask])
+            task_logits = self._network.fc(task_features)["logits"]
+            start, end = self._task_ranges[task_idx]
+            # disjoint class blocks across tasks -> no overwrite between experts
+            out_logits[mask, start:end] = task_logits[:, start:end]
+
+        return out_logits
 
     def after_task(self):
         self._network.backbone.reset_tosca()
@@ -479,7 +475,9 @@ class Learner(BaseLearner):
 
         self._gate.eval()
         correct = 0
+        recall_k_correct = 0
         total = 0
+        k = max(1, min(self._moe_top_k, len(self._task_ranges)))
         per_task = {
             task_idx: {"correct": 0, "total": 0, "predicted": 0}
             for task_idx in range(len(self._task_ranges))
@@ -494,6 +492,7 @@ class Learner(BaseLearner):
                 features = self._prepare_gate_features(features)
                 gate_logits = self._gate(features)
                 chosen_task = torch.argmax(gate_logits, dim=1).cpu()
+                topk_tasks = torch.topk(gate_logits, k, dim=1).indices.cpu()  # [B, k]
 
                 true_task = torch.zeros_like(targets)
                 for t, (start, end) in enumerate(self._task_ranges):
@@ -501,6 +500,9 @@ class Learner(BaseLearner):
                     true_task[mask] = t
 
                 correct += (chosen_task == true_task).sum().item()
+                recall_k_correct += (
+                    (topk_tasks == true_task.unsqueeze(1)).any(dim=1).sum().item()
+                )
                 total += targets.size(0)
                 for task_idx in range(len(self._task_ranges)):
                     true_mask = true_task == task_idx
@@ -512,12 +514,18 @@ class Learner(BaseLearner):
                     per_task[task_idx]["predicted"] += pred_mask.sum().item()
 
         gate_acc = 100.0 * correct / total if total > 0 else 0.0
+        recall_at_k = 100.0 * recall_k_correct / total if total > 0 else 0.0
         for task_idx, stats in per_task.items():
             task_total = stats["total"]
             stats["accuracy"] = (
                 100.0 * stats["correct"] / task_total if task_total > 0 else 0.0
             )
-        return {"top1": gate_acc, "per_task": per_task}
+        return {
+            "top1": gate_acc,
+            "recall_at_k": recall_at_k,
+            "top_k": k,
+            "per_task": per_task,
+        }
 
     def _compute_gate_routing_flops(self, batch_size=1):
         input_dim = int(self._gate_feature_dim)
@@ -563,10 +571,10 @@ class Learner(BaseLearner):
         for _, (_, inputs, targets) in enumerate(loader):
             inputs, targets = inputs.to(self._device), targets.long().to(self._device)
             with torch.no_grad():
-                outputs = self._get_gate_routed_logits(inputs)
-            predicts = torch.topk(outputs, k=self.topk, dim=1, largest=True, sorted=True)[
-                1
-            ]
+                outputs = self._get_moe_routed_logits(inputs)
+            predicts = torch.topk(
+                outputs, k=self.topk, dim=1, largest=True, sorted=True
+            )[1]
             y_pred.append(predicts.cpu().numpy())
             y_true.append(targets.cpu().numpy())
 

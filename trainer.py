@@ -197,6 +197,15 @@ def print_args(args):
 def _log_gate_metrics(task, gate_accy, eval_wall_seconds):
     logging.info("Task {} eval time: {:.2f}s".format(task, eval_wall_seconds))
 
+    if "recall_at_k" in gate_accy:
+        logging.info(
+            "Gate routing top1: {:.2f}%, recall@{}: {:.2f}% (MoE accuracy ceiling)".format(
+                gate_accy.get("top1", 0.0),
+                gate_accy.get("top_k", 1),
+                gate_accy["recall_at_k"],
+            )
+        )
+
     if "eval_seconds" in gate_accy:
         logging.info(
             "Gate routing eval time: {:.2f}s ({:.3f} ms/sample)".format(
