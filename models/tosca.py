@@ -42,6 +42,8 @@ class Learner(BaseLearner):
 
         # Joint classifier over concatenated top-k expert features.
         self._moe_head = None
+        # idx -> saved tosca state dict (files are immutable once written).
+        self._tosca_state_cache = {}
 
     @property
     def _gate_feature_dim(self):
@@ -510,27 +512,38 @@ class Learner(BaseLearner):
                 dropout=float(self.args.get("moe_dropout", 0.1)),
             ).to(self._device)
 
-        tensors = self._build_moe_training_tensors()
-        if tensors is None:
+        # Fresh synthetic draw every epoch: the head then learns the population
+        # decision boundary of the per-class Gaussians instead of memorizing one
+        # finite draw, which is the main lever for closing the synthetic->real
+        # gap while staying fully synthetic. Disable to reuse a single draw.
+        resample = bool(self.args.get("moe_resample_each_epoch", True))
+        batch_size = int(self.args.get("moe_batch_size", 512))
+
+        def build_loader():
+            tensors = self._build_moe_training_tensors()
+            if tensors is None:
+                return None, None
+            train_x, train_y, has_true = tensors
+            loader = DataLoader(
+                TensorDataset(train_x, train_y),
+                batch_size=batch_size,
+                shuffle=True,
+                num_workers=0,
+            )
+            return loader, has_true
+
+        loader, has_true = build_loader()
+        if loader is None:
             logging.warning("No replay features available for MoE head training.")
             return
-        train_x, train_y, has_true = tensors
-
-        coverage = 100.0 * has_true.float().mean().item()
         logging.info(
-            "MoE head Task %s: %d replay samples, true task routed in top-%d for %.2f%%.",
+            "MoE head Task %s: %d replay samples/epoch, true task routed in top-%d "
+            "for %.2f%% (resample_each_epoch=%s).",
             self._cur_task,
-            train_x.size(0),
+            len(loader.dataset),
             max(1, min(top_k, num_tasks)),
-            coverage,
-        )
-
-        dataset = TensorDataset(train_x, train_y)
-        loader = DataLoader(
-            dataset,
-            batch_size=int(self.args.get("moe_batch_size", 512)),
-            shuffle=True,
-            num_workers=0,
+            100.0 * has_true.float().mean().item(),
+            resample,
         )
 
         optimizer = optim.Adam(
@@ -538,11 +551,16 @@ class Learner(BaseLearner):
             lr=float(self.args.get("moe_lr", 1e-3)),
             weight_decay=float(self.args.get("moe_weight_decay", 1e-4)),
         )
-        criterion = torch.nn.CrossEntropyLoss(ignore_index=-100)
+        criterion = torch.nn.CrossEntropyLoss(
+            ignore_index=-100,
+            label_smoothing=float(self.args.get("moe_label_smoothing", 0.0)),
+        )
         epochs = int(self.args.get("moe_epochs", 30))
 
         self._moe_head.train()
         for epoch in range(epochs):
+            if resample and epoch > 0:
+                loader, _ = build_loader()
             epoch_loss = 0.0
             correct = 0
             total = 0
@@ -845,8 +863,15 @@ class Learner(BaseLearner):
         logging.info(f"tosca parameters saved to {path}.")
 
     def _load_tosca(self, idx):
-        path = f"tosca/task{idx}.pth"
-        tosca_state_dict = torch.load(path, map_location=self._device)
+        # tosca/task{idx}.pth is written once and never modified, so the loaded
+        # state can be cached to avoid repeated disk reads (hot in per-epoch
+        # head resampling and per-batch eval routing).
+        tosca_state_dict = self._tosca_state_cache.get(idx)
+        if tosca_state_dict is None:
+            tosca_state_dict = torch.load(
+                f"tosca/task{idx}.pth", map_location=self._device
+            )
+            self._tosca_state_cache[idx] = tosca_state_dict
         current_state_dict = self._network.state_dict()
         current_state_dict.update(tosca_state_dict)
         self._network.load_state_dict(current_state_dict)

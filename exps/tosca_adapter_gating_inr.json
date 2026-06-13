@@ -45,5 +45,7 @@
   "moe_weight_decay": 0.0001,
   "moe_batch_size": 512,
   "moe_synthetic_per_class": 200,
-  "moe_stats_mode": "covariance"
+  "moe_stats_mode": "covariance",
+  "moe_resample_each_epoch": true,
+  "moe_label_smoothing": 0.05
 }
