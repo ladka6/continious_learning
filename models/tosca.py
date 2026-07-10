@@ -608,14 +608,20 @@ class Learner(BaseLearner):
         )
         logging.info(f"MoE head parameters saved to {path}.")
 
-    def _get_moe_routed_logits(self, inputs):
+    def _get_moe_routed_logits(self, inputs, oracle_tasks=None):
         """Top-k mixture-of-experts routing with a JOINT head. The gate selects
         the top-k tasks per sample; each selected task's tosca produces that
         sample's slot feature; the slot features are concatenated (gate-rank
         order, zero-padded) and a single PositionalMoEHead scores them jointly.
         The head's per-slot class scores are scattered back to the selected
         tasks' (disjoint) global class blocks, and argmax over that union is the
-        prediction. k = moe_top_k."""
+        prediction. k = moe_top_k.
+
+        If ``oracle_tasks`` ([B] long tensor of true task ids) is given, each
+        sample's true task is guaranteed to be in the routed set (swapped into
+        the lowest-ranked slot when the gate missed it). This forces routing
+        recall@k = 100%, isolating the head's within-set accuracy from the
+        gate's recall loss."""
         if self._gate is None or self._gate.num_tasks < (self._cur_task + 1):
             raise RuntimeError(
                 "Gate is not initialized or out of sync with current task count."
@@ -636,6 +642,16 @@ class Learner(BaseLearner):
         feature_dim = self._gate_feature_dim
         batch_size = inputs.size(0)
         topk_tasks = torch.topk(gate_logits, eff_k, dim=1).indices  # [B, eff_k]
+
+        # Oracle routing: guarantee the true task is in the routed set so that
+        # recall@k = 100%. Only override samples the gate already missed, and
+        # place the true task in the lowest-ranked slot to perturb the gate's
+        # top choices as little as possible.
+        if oracle_tasks is not None:
+            oracle_tasks = oracle_tasks.to(topk_tasks.device)
+            missing = ~(topk_tasks == oracle_tasks.unsqueeze(1)).any(dim=1)
+            if missing.any():
+                topk_tasks[missing, eff_k - 1] = oracle_tasks[missing]
 
         # Build the [B, top_k, D] concatenated expert features (zero-padded).
         slot_feats = torch.zeros(
@@ -824,7 +840,11 @@ class Learner(BaseLearner):
         y_pred, y_true = self._eval_cnn(self.test_loader)
         cnn_accy = self._evaluate(y_pred, y_true)
         nme_accy = None
+        oracle_pred, oracle_true = self._eval_cnn(self.test_loader, oracle=True)
+        oracle_accy = self._evaluate(oracle_pred, oracle_true)
         gate_accy = self._eval_gate_routing(self.test_loader)
+        if gate_accy is not None:
+            gate_accy["oracle_top1"] = oracle_accy["top1"]
         eval_seconds = time.perf_counter() - eval_start
         num_samples = len(self.test_loader.dataset)
         gate_flops = self._compute_gate_routing_flops(
@@ -836,14 +856,26 @@ class Learner(BaseLearner):
             gate_accy["routing_flops"] = gate_flops
         return cnn_accy, nme_accy, gate_accy
 
-    def _eval_cnn(self, loader):
+    def _true_task_from_targets(self, targets):
+        """Map global class labels [B] to their task ids [B] via task ranges."""
+        true_task = torch.zeros_like(targets)
+        for t, (start, end) in enumerate(self._task_ranges):
+            true_task[(targets >= start) & (targets < end)] = t
+        return true_task
+
+    def _eval_cnn(self, loader, oracle=False):
         self._network.eval()
         y_pred, y_true = [], []
 
         for _, (_, inputs, targets) in enumerate(loader):
             inputs, targets = inputs.to(self._device), targets.long().to(self._device)
             with torch.no_grad():
-                outputs = self._get_moe_routed_logits(inputs)
+                oracle_tasks = (
+                    self._true_task_from_targets(targets) if oracle else None
+                )
+                outputs = self._get_moe_routed_logits(
+                    inputs, oracle_tasks=oracle_tasks
+                )
             predicts = torch.topk(
                 outputs, k=self.topk, dim=1, largest=True, sorted=True
             )[1]

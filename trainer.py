@@ -206,6 +206,15 @@ def _log_gate_metrics(task, gate_accy, eval_wall_seconds):
             )
         )
 
+    if "oracle_top1" in gate_accy:
+        logging.info(
+            "Oracle-routed CNN top1: {:.2f}% (true task forced in top-{}; "
+            "head accuracy given perfect routing)".format(
+                gate_accy["oracle_top1"],
+                gate_accy.get("top_k", 1),
+            )
+        )
+
     if "eval_seconds" in gate_accy:
         logging.info(
             "Gate routing eval time: {:.2f}s ({:.3f} ms/sample)".format(
