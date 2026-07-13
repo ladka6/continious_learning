@@ -9,7 +9,6 @@ from torch.utils.data import DataLoader, TensorDataset
 
 from utils.gating import (
     TaskGate,
-    PositionalMoEHead,
     FeatureStatsCollector,
     generate_samples,
 )
@@ -34,14 +33,11 @@ class Learner(BaseLearner):
         # task_id -> {class_id: {"mean", "covariance", "count"}} on L2-normalized
         # features (used to train/route the gate).
         self._task_feature_stats = {}
-        # Same, but on raw (pre-L2-normalize) features. The toscas are trained on
-        # raw features, so head replay must be drawn from these.
-        self._task_raw_feature_stats = {}
         self._latest_task_timing = {}
-        self._moe_top_k = int(self.args.get("moe_top_k", 1))
+        # How many experts the gate routes per sample. With top_k >= num_tasks
+        # this reduces to the TOSCA paper's original run-every-expert inference.
+        self._top_k = int(self.args.get("gate_top_k", self.args.get("moe_top_k", 2)))
 
-        # Joint classifier over concatenated top-k expert features.
-        self._moe_head = None
         # idx -> saved tosca state dict (files are immutable once written).
         self._tosca_state_cache = {}
 
@@ -154,10 +150,6 @@ class Learner(BaseLearner):
         self._train_gate()
         gate_train_seconds = time.perf_counter() - gate_train_start
 
-        moe_head_train_start = time.perf_counter()
-        self._train_moe_head()
-        moe_head_train_seconds = time.perf_counter() - moe_head_train_start
-
         replace_fc_start = time.perf_counter()
         self.replace_fc()
         replace_fc_seconds = time.perf_counter() - replace_fc_start
@@ -167,17 +159,15 @@ class Learner(BaseLearner):
             "backbone_train_seconds": backbone_train_seconds,
             "feature_collection_seconds": feature_collection_seconds,
             "gate_train_seconds": gate_train_seconds,
-            "moe_head_train_seconds": moe_head_train_seconds,
             "replace_fc_seconds": replace_fc_seconds,
             "task_train_seconds": task_train_seconds,
         }
         logging.info(
-            "Task {} timing => backbone_train {:.2f}s, feature_collection {:.2f}s, gate_train {:.2f}s, moe_head_train {:.2f}s, replace_fc {:.2f}s, total_train {:.2f}s".format(
+            "Task {} timing => backbone_train {:.2f}s, feature_collection {:.2f}s, gate_train {:.2f}s, replace_fc {:.2f}s, total_train {:.2f}s".format(
                 self._cur_task,
                 backbone_train_seconds,
                 feature_collection_seconds,
                 gate_train_seconds,
-                moe_head_train_seconds,
                 replace_fc_seconds,
                 task_train_seconds,
             )
@@ -218,12 +208,6 @@ class Learner(BaseLearner):
     def _gate_min_variance(self):
         return float(self.args.get("gate_min_variance", 1e-6))
 
-    def _moe_stats_mode(self):
-        return str(self.args.get("moe_stats_mode", "covariance"))
-
-    def _moe_synthetic_per_class(self):
-        return int(self.args.get("moe_synthetic_per_class", self._synthetic_per_class()))
-
     def _classes_per_task(self):
         start, end = self._task_ranges[0]
         return end - start
@@ -238,25 +222,16 @@ class Learner(BaseLearner):
             min_variance=self._gate_min_variance(),
             stats_mode="covariance",
         )
-        raw_collector = FeatureStatsCollector(
-            feature_dim=self._gate_feature_dim,
-            min_variance=self._gate_min_variance(),
-            stats_mode=self._moe_stats_mode(),
-        )
         with torch.no_grad():
             for _, data, label in self.train_loader_for_protonet:
                 data = data.to(self._device)
                 label = label.long()
                 features = self._extract_backbone_features(data)
-                raw_collector.update(features, label)
                 norm_features = self._prepare_gate_features(features)
                 collector.update(norm_features, label)
 
         class_stats = collector.compute_mean_variance()
         self._task_feature_stats[self._cur_task] = class_stats
-        self._task_raw_feature_stats[self._cur_task] = (
-            raw_collector.compute_mean_variance()
-        )
         logging.info(
             "Stored full-covariance gate stats for task %s (%s classes).",
             self._cur_task,
@@ -397,295 +372,57 @@ class Learner(BaseLearner):
         )
         logging.info(f"Gate parameters saved to {path}.")
 
-    def _generate_head_replay_raw(self):
-        """Synthetic raw (pre-normalize) ViT features for every class seen so
-        far, labeled by GLOBAL class id, drawn from the stored per-class
-        Gaussians. These are pushed through the toscas to train the head."""
-        n_samples = self._moe_synthetic_per_class()
-        min_variance = self._gate_min_variance()
+    def _get_routed_prototype_logits(self, inputs):
+        """TOSCA-paper inference restricted to the gate's top-k experts.
 
-        all_features = []
-        all_labels = []
-        for task_idx in range(self._cur_task + 1):
-            class_stats = self._task_raw_feature_stats.get(task_idx)
-            if not class_stats:
-                continue
-            feats, labels = generate_samples(
-                class_stats,
-                n_samples=n_samples,
-                min_variance=min_variance,
-                device="cpu",
-            )
-            if feats.numel() == 0:
-                continue
-            all_features.append(feats)
-            all_labels.append(labels)
-
-        if len(all_features) == 0:
-            return (
-                torch.empty(0, self._gate_feature_dim),
-                torch.empty(0, dtype=torch.long),
-            )
-        return torch.cat(all_features, dim=0), torch.cat(all_labels, dim=0)
-
-    def _build_moe_training_tensors(self):
-        """Turn replayed raw features into (concatenated expert features,
-        positional target) pairs for head training. The gate (frozen) picks the
-        top-k experts per sample; each selected tosca produces that sample's
-        slot feature; the target is the slot+local-class index of the sample's
-        true task (ignored when the true task is not in the top-k)."""
-        raw_x, class_y = self._generate_head_replay_raw()
-        if raw_x.numel() == 0:
-            return None
-
-        num_tasks = self._cur_task + 1
-        top_k = self._moe_top_k
-        eff_k = max(1, min(top_k, num_tasks))
-        inc = self._classes_per_task()
-        feature_dim = self._gate_feature_dim
-        n = raw_x.size(0)
-        chunk = 4096
-
-        starts = torch.tensor([s for s, _ in self._task_ranges])
-        true_task = torch.zeros(n, dtype=torch.long)
-        for t, (start, end) in enumerate(self._task_ranges):
-            true_task[(class_y >= start) & (class_y < end)] = t
-
-        assert self._gate is not None
-        self._gate.eval()
-        raw_x_dev = raw_x.to(self._device)
-
-        # Frozen-gate top-k routing for every replay sample.
-        topk_chunks = []
-        with torch.no_grad():
-            for i in range(0, n, chunk):
-                xb = raw_x_dev[i : i + chunk]
-                gate_logits = self._gate(self._prepare_gate_features(xb))
-                topk_chunks.append(torch.topk(gate_logits, eff_k, dim=1).indices.cpu())
-        topk_tasks = torch.cat(topk_chunks, dim=0)  # [N, eff_k]
-
-        # Per-sample slot features. Load each tosca once, fill the slots that
-        # selected it. Slots >= eff_k stay zero-padded.
-        slot_feats = torch.zeros(n, top_k, feature_dim)
-        with torch.no_grad():
-            for t in range(num_tasks):
-                sel = topk_tasks == t  # [N, eff_k]
-                rows = sel.any(dim=1)
-                if not rows.any():
-                    continue
-                self._load_tosca(t)
-                idx = rows.nonzero(as_tuple=True)[0]
-                ft_full = torch.zeros(n, feature_dim)
-                for i in range(0, idx.numel(), chunk):
-                    rows_chunk = idx[i : i + chunk]
-                    ft_full[rows_chunk] = (
-                        self._get_backbone()
-                        .forward_tosca(raw_x_dev[rows_chunk])
-                        .cpu()
-                    )
-                for s in range(eff_k):
-                    slot_mask = sel[:, s]
-                    if slot_mask.any():
-                        slot_feats[slot_mask, s, :] = ft_full[slot_mask]
-
-        match = topk_tasks == true_task.unsqueeze(1)  # [N, eff_k]
-        has_true = match.any(dim=1)
-        slot_idx = torch.argmax(match.int(), dim=1)  # first matching slot
-        local_class = class_y - starts[true_task]
-        target = slot_idx * inc + local_class
-        target[~has_true] = -100  # unrecoverable: true task not routed
-
-        return slot_feats.reshape(n, top_k * feature_dim), target, has_true
-
-    def _train_moe_head(self):
-        num_tasks = self._cur_task + 1
-        top_k = self._moe_top_k
-        inc = self._classes_per_task()
-        feature_dim = self._gate_feature_dim
-
-        if self._moe_head is None:
-            self._moe_head = PositionalMoEHead(
-                feature_dim=feature_dim,
-                top_k=top_k,
-                classes_per_task=inc,
-                hidden_dim=int(self.args.get("moe_hidden_dim", 1024)),
-                dropout=float(self.args.get("moe_dropout", 0.1)),
-            ).to(self._device)
-
-        # Fresh synthetic draw every epoch: the head then learns the population
-        # decision boundary of the per-class Gaussians instead of memorizing one
-        # finite draw, which is the main lever for closing the synthetic->real
-        # gap while staying fully synthetic. Disable to reuse a single draw.
-        resample = bool(self.args.get("moe_resample_each_epoch", True))
-        batch_size = int(self.args.get("moe_batch_size", 512))
-
-        def build_loader():
-            tensors = self._build_moe_training_tensors()
-            if tensors is None:
-                return None, None
-            train_x, train_y, has_true = tensors
-            loader = DataLoader(
-                TensorDataset(train_x, train_y),
-                batch_size=batch_size,
-                shuffle=True,
-                num_workers=0,
-            )
-            return loader, has_true
-
-        loader, has_true = build_loader()
-        if loader is None:
-            logging.warning("No replay features available for MoE head training.")
-            return
-        logging.info(
-            "MoE head Task %s: %d replay samples/epoch, true task routed in top-%d "
-            "for %.2f%% (resample_each_epoch=%s).",
-            self._cur_task,
-            len(loader.dataset),
-            max(1, min(top_k, num_tasks)),
-            100.0 * has_true.float().mean().item(),
-            resample,
-        )
-
-        optimizer = optim.Adam(
-            self._moe_head.parameters(),
-            lr=float(self.args.get("moe_lr", 1e-3)),
-            weight_decay=float(self.args.get("moe_weight_decay", 1e-4)),
-        )
-        criterion = torch.nn.CrossEntropyLoss(
-            ignore_index=-100,
-            label_smoothing=float(self.args.get("moe_label_smoothing", 0.0)),
-        )
-        epochs = int(self.args.get("moe_epochs", 30))
-
-        self._moe_head.train()
-        for epoch in range(epochs):
-            if resample and epoch > 0:
-                loader, _ = build_loader()
-            epoch_loss = 0.0
-            correct = 0
-            total = 0
-            for features, targets in loader:
-                features = features.to(self._device)
-                targets = targets.to(self._device)
-
-                optimizer.zero_grad()
-                logits = self._moe_head(features)
-                loss = criterion(logits, targets)
-                loss.backward()
-                optimizer.step()
-
-                epoch_loss += loss.item()
-                valid = targets != -100
-                if valid.any():
-                    preds = torch.argmax(logits, dim=1)
-                    correct += (preds[valid] == targets[valid]).sum().item()
-                    total += int(valid.sum().item())
-
-            avg_loss = epoch_loss / max(len(loader), 1)
-            train_acc = 100.0 * correct / total if total > 0 else 0.0
-            logging.info(
-                f"MoE Head Task {self._cur_task}, Epoch {epoch + 1}/{epochs} => "
-                f"Loss {avg_loss:.4f}, Train_accy {train_acc:.2f}"
-            )
-
-        self._moe_head.eval()
-        self._save_moe_head()
-
-    def _save_moe_head(self):
-        if self._moe_head is None:
-            return
-        path = f"tosca/moe_head_task{self._cur_task}.pth"
-        torch.save(
-            {
-                "state_dict": self._moe_head.state_dict(),
-                "feature_dim": self._gate_feature_dim,
-                "top_k": self._moe_top_k,
-                "classes_per_task": self._classes_per_task(),
-                "hidden_dim": int(self.args.get("moe_hidden_dim", 1024)),
-                "dropout": float(self.args.get("moe_dropout", 0.1)),
-            },
-            path,
-        )
-        logging.info(f"MoE head parameters saved to {path}.")
-
-    def _get_moe_routed_logits(self, inputs, oracle_tasks=None):
-        """Top-k mixture-of-experts routing with a JOINT head. The gate selects
-        the top-k tasks per sample; each selected task's tosca produces that
-        sample's slot feature; the slot features are concatenated (gate-rank
-        order, zero-padded) and a single PositionalMoEHead scores them jointly.
-        The head's per-slot class scores are scattered back to the selected
-        tasks' (disjoint) global class blocks, and argmax over that union is the
-        prediction. k = moe_top_k.
-
-        If ``oracle_tasks`` ([B] long tensor of true task ids) is given, each
-        sample's true task is guaranteed to be in the routed set (swapped into
-        the lowest-ranked slot when the gate missed it). This forces routing
-        recall@k = 100%, isolating the head's within-set accuracy from the
-        gate's recall loss."""
+        One frozen-backbone forward produces shared ViT features. The gate
+        selects k candidate tasks per sample; each candidate's tosca transforms
+        the shared features and the cosine prototype classifier (fc, filled by
+        replace_fc with real class means) scores ALL seen classes from that
+        expert's feature space. Following the paper, the winning expert is the
+        one whose class distribution has minimum Shannon entropy, and its
+        logits are returned. With top_k >= num_tasks this is exactly the
+        paper's run-every-expert inference; smaller k trades a little recall
+        for k instead of N expert forwards."""
         if self._gate is None or self._gate.num_tasks < (self._cur_task + 1):
             raise RuntimeError(
                 "Gate is not initialized or out of sync with current task count."
             )
-        if self._moe_head is None:
-            raise RuntimeError("MoE head is not initialized.")
 
         self._gate.eval()
-        self._moe_head.eval()
         vit_features = self._extract_backbone_features(inputs)
-        gate_features = self._prepare_gate_features(vit_features)
-        gate_logits = self._gate(gate_features)
+        gate_logits = self._gate(self._prepare_gate_features(vit_features))
 
         num_tasks = self._cur_task + 1
-        top_k = self._moe_top_k
-        eff_k = max(1, min(top_k, num_tasks))
-        inc = self._classes_per_task()
-        feature_dim = self._gate_feature_dim
+        eff_k = max(1, min(self._top_k, num_tasks))
         batch_size = inputs.size(0)
+        total_classes = self._network.fc.out_features
         topk_tasks = torch.topk(gate_logits, eff_k, dim=1).indices  # [B, eff_k]
 
-        # Oracle routing: guarantee the true task is in the routed set so that
-        # recall@k = 100%. Only override samples the gate already missed, and
-        # place the true task in the lowest-ranked slot to perturb the gate's
-        # top choices as little as possible.
-        if oracle_tasks is not None:
-            oracle_tasks = oracle_tasks.to(topk_tasks.device)
-            missing = ~(topk_tasks == oracle_tasks.unsqueeze(1)).any(dim=1)
-            if missing.any():
-                topk_tasks[missing, eff_k - 1] = oracle_tasks[missing]
-
-        # Build the [B, top_k, D] concatenated expert features (zero-padded).
-        slot_feats = torch.zeros(
-            batch_size, top_k, feature_dim, device=inputs.device
+        # Each candidate expert's full-class cosine logits, per sample.
+        cand_logits = torch.zeros(
+            batch_size, eff_k, total_classes, device=inputs.device
         )
         for task_idx in torch.unique(topk_tasks).tolist():
             task_idx = int(task_idx)
             sel = topk_tasks == task_idx  # [B, eff_k]
+            rows = sel.any(dim=1)
             self._load_tosca(task_idx)
-            task_features = self._get_backbone().forward_tosca(vit_features)
+            task_features = self._get_backbone().forward_tosca(vit_features[rows])
+            logits = self._network.fc(task_features)["logits"]  # [rows, C]
+            full = torch.zeros(batch_size, total_classes, device=inputs.device)
+            full[rows] = logits
             for s in range(eff_k):
                 slot_mask = sel[:, s]
                 if slot_mask.any():
-                    slot_feats[slot_mask, s, :] = task_features[slot_mask]
+                    cand_logits[slot_mask, s, :] = full[slot_mask]
 
-        head_logits = self._moe_head(
-            slot_feats.reshape(batch_size, top_k * feature_dim)
-        ).view(batch_size, top_k, inc)
-
-        # Scatter each slot's class scores into its task's global class block.
-        total_classes = self._network.fc.out_features
-        out_logits = torch.full(
-            (batch_size, total_classes), float("-inf"), device=inputs.device
-        )
-        starts = torch.tensor(
-            [s for s, _ in self._task_ranges], device=inputs.device
-        )
-        offsets = torch.arange(inc, device=inputs.device)
-        for s in range(eff_k):
-            block_start = starts[topk_tasks[:, s]]  # [B]
-            idx = block_start.unsqueeze(1) + offsets.unsqueeze(0)  # [B, inc]
-            out_logits.scatter_(1, idx, head_logits[:, s, :])
-
-        return out_logits
+        # Entropy minimization over candidates: the correct expert is the most
+        # confident one (paper Eq. for prediction).
+        probs = torch.softmax(cand_logits, dim=2)
+        entropy = -(probs * torch.log(probs.clamp_min(1e-12))).sum(dim=2)  # [B, eff_k]
+        best_slot = entropy.argmin(dim=1)  # [B]
+        return cand_logits[torch.arange(batch_size, device=inputs.device), best_slot]
 
     def after_task(self):
         self._network.backbone.reset_tosca()
@@ -765,7 +502,7 @@ class Learner(BaseLearner):
         correct = 0
         recall_k_correct = 0
         total = 0
-        k = max(1, min(self._moe_top_k, len(self._task_ranges)))
+        k = max(1, min(self._top_k, len(self._task_ranges)))
         per_task = {
             task_idx: {"correct": 0, "total": 0, "predicted": 0}
             for task_idx in range(len(self._task_ranges))
@@ -840,13 +577,7 @@ class Learner(BaseLearner):
         y_pred, y_true = self._eval_cnn(self.test_loader)
         cnn_accy = self._evaluate(y_pred, y_true)
         nme_accy = None
-        oracle_pred, oracle_true = self._eval_cnn(self.test_loader, oracle=True)
-        oracle_accy = self._evaluate(oracle_pred, oracle_true)
-        within_task_top1 = self._eval_within_task_head(self.test_loader)
         gate_accy = self._eval_gate_routing(self.test_loader)
-        if gate_accy is not None:
-            gate_accy["oracle_top1"] = oracle_accy["top1"]
-            gate_accy["within_task_top1"] = within_task_top1
         eval_seconds = time.perf_counter() - eval_start
         num_samples = len(self.test_loader.dataset)
         gate_flops = self._compute_gate_routing_flops(
@@ -858,26 +589,14 @@ class Learner(BaseLearner):
             gate_accy["routing_flops"] = gate_flops
         return cnn_accy, nme_accy, gate_accy
 
-    def _true_task_from_targets(self, targets):
-        """Map global class labels [B] to their task ids [B] via task ranges."""
-        true_task = torch.zeros_like(targets)
-        for t, (start, end) in enumerate(self._task_ranges):
-            true_task[(targets >= start) & (targets < end)] = t
-        return true_task
-
-    def _eval_cnn(self, loader, oracle=False):
+    def _eval_cnn(self, loader):
         self._network.eval()
         y_pred, y_true = [], []
 
         for _, (_, inputs, targets) in enumerate(loader):
             inputs, targets = inputs.to(self._device), targets.long().to(self._device)
             with torch.no_grad():
-                oracle_tasks = (
-                    self._true_task_from_targets(targets) if oracle else None
-                )
-                outputs = self._get_moe_routed_logits(
-                    inputs, oracle_tasks=oracle_tasks
-                )
+                outputs = self._get_routed_prototype_logits(inputs)
             predicts = torch.topk(
                 outputs, k=self.topk, dim=1, largest=True, sorted=True
             )[1]
@@ -885,48 +604,6 @@ class Learner(BaseLearner):
             y_true.append(targets.cpu().numpy())
 
         return np.concatenate(y_pred), np.concatenate(y_true)
-
-    def _eval_within_task_head(self, loader):
-        """Upper bound on expert quality under PERFECT routing and NO cross-task
-        interference: route each sample to its own true task placed in slot 0,
-        then argmax over ONLY that task's 20-class block. Compared to the global
-        oracle, this removes both the router and the distractor classes from
-        other tasks, so the gap between this and the real CNN accuracy tells us
-        how much is lost to cross-task confusion vs. weak experts."""
-        if self._moe_head is None:
-            return None
-        self._moe_head.eval()
-        top_k = self._moe_top_k
-        feature_dim = self._gate_feature_dim
-        inc = self._classes_per_task()
-        starts = [s for s, _ in self._task_ranges]
-        correct, total = 0, 0
-        with torch.no_grad():
-            for _, inputs, targets in loader:
-                inputs = inputs.to(self._device)
-                targets = targets.long().to(self._device)
-                true_task = self._true_task_from_targets(targets)
-                vit_features = self._extract_backbone_features(inputs)
-                bs = inputs.size(0)
-                slot_feats = torch.zeros(
-                    bs, top_k, feature_dim, device=self._device
-                )
-                for t in torch.unique(true_task).tolist():
-                    sel = true_task == int(t)
-                    self._load_tosca(int(t))
-                    task_features = self._get_backbone().forward_tosca(vit_features)
-                    slot_feats[sel, 0, :] = task_features[sel]
-                head_logits = self._moe_head(
-                    slot_feats.reshape(bs, top_k * feature_dim)
-                ).view(bs, top_k, inc)
-                pred_local = head_logits[:, 0, :].argmax(dim=1)  # [B] in 0..inc-1
-                block_start = torch.tensor(
-                    [starts[t] for t in true_task.tolist()], device=self._device
-                )
-                true_local = targets - block_start
-                correct += (pred_local == true_local).sum().item()
-                total += bs
-        return 100.0 * correct / max(total, 1)
 
     def _save_tosca(self):
         path = f"tosca/task{self._cur_task}.pth"

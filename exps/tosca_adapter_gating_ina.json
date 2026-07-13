@@ -37,15 +37,5 @@
   "gate_min_variance": 1e-6,
   "gate_normalize_features": true,
 
-  "moe_top_k": 5,
-  "moe_hidden_dim": 1024,
-  "moe_dropout": 0.1,
-  "moe_epochs": 30,
-  "moe_lr": 0.001,
-  "moe_weight_decay": 0.0001,
-  "moe_batch_size": 512,
-  "moe_synthetic_per_class": 200,
-  "moe_stats_mode": "covariance",
-  "moe_resample_each_epoch": true,
-  "moe_label_smoothing": 0.05
+  "gate_top_k": 2
 }

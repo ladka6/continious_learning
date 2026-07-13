@@ -199,27 +199,10 @@ def _log_gate_metrics(task, gate_accy, eval_wall_seconds):
 
     if "recall_at_k" in gate_accy:
         logging.info(
-            "Gate routing top1: {:.2f}%, recall@{}: {:.2f}% (MoE accuracy ceiling)".format(
+            "Gate routing top1: {:.2f}%, recall@{}: {:.2f}% (routed accuracy ceiling)".format(
                 gate_accy.get("top1", 0.0),
                 gate_accy.get("top_k", 1),
                 gate_accy["recall_at_k"],
-            )
-        )
-
-    if "oracle_top1" in gate_accy:
-        logging.info(
-            "Oracle-routed CNN top1: {:.2f}% (true task forced in top-{}; "
-            "head accuracy given perfect routing)".format(
-                gate_accy["oracle_top1"],
-                gate_accy.get("top_k", 1),
-            )
-        )
-
-    if gate_accy.get("within_task_top1") is not None:
-        logging.info(
-            "Within-task head top1: {:.2f}% (true expert in slot 0, argmax over "
-            "true task's classes only; expert-quality ceiling)".format(
-                gate_accy["within_task_top1"],
             )
         )
 
