@@ -215,6 +215,14 @@ def _log_gate_metrics(task, gate_accy, eval_wall_seconds):
             )
         )
 
+    if gate_accy.get("within_task_top1") is not None:
+        logging.info(
+            "Within-task head top1: {:.2f}% (true expert in slot 0, argmax over "
+            "true task's classes only; expert-quality ceiling)".format(
+                gate_accy["within_task_top1"],
+            )
+        )
+
     if "eval_seconds" in gate_accy:
         logging.info(
             "Gate routing eval time: {:.2f}s ({:.3f} ms/sample)".format(

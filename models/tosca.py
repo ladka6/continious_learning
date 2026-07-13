@@ -842,9 +842,11 @@ class Learner(BaseLearner):
         nme_accy = None
         oracle_pred, oracle_true = self._eval_cnn(self.test_loader, oracle=True)
         oracle_accy = self._evaluate(oracle_pred, oracle_true)
+        within_task_top1 = self._eval_within_task_head(self.test_loader)
         gate_accy = self._eval_gate_routing(self.test_loader)
         if gate_accy is not None:
             gate_accy["oracle_top1"] = oracle_accy["top1"]
+            gate_accy["within_task_top1"] = within_task_top1
         eval_seconds = time.perf_counter() - eval_start
         num_samples = len(self.test_loader.dataset)
         gate_flops = self._compute_gate_routing_flops(
@@ -883,6 +885,48 @@ class Learner(BaseLearner):
             y_true.append(targets.cpu().numpy())
 
         return np.concatenate(y_pred), np.concatenate(y_true)
+
+    def _eval_within_task_head(self, loader):
+        """Upper bound on expert quality under PERFECT routing and NO cross-task
+        interference: route each sample to its own true task placed in slot 0,
+        then argmax over ONLY that task's 20-class block. Compared to the global
+        oracle, this removes both the router and the distractor classes from
+        other tasks, so the gap between this and the real CNN accuracy tells us
+        how much is lost to cross-task confusion vs. weak experts."""
+        if self._moe_head is None:
+            return None
+        self._moe_head.eval()
+        top_k = self._moe_top_k
+        feature_dim = self._gate_feature_dim
+        inc = self._classes_per_task()
+        starts = [s for s, _ in self._task_ranges]
+        correct, total = 0, 0
+        with torch.no_grad():
+            for _, inputs, targets in loader:
+                inputs = inputs.to(self._device)
+                targets = targets.long().to(self._device)
+                true_task = self._true_task_from_targets(targets)
+                vit_features = self._extract_backbone_features(inputs)
+                bs = inputs.size(0)
+                slot_feats = torch.zeros(
+                    bs, top_k, feature_dim, device=self._device
+                )
+                for t in torch.unique(true_task).tolist():
+                    sel = true_task == int(t)
+                    self._load_tosca(int(t))
+                    task_features = self._get_backbone().forward_tosca(vit_features)
+                    slot_feats[sel, 0, :] = task_features[sel]
+                head_logits = self._moe_head(
+                    slot_feats.reshape(bs, top_k * feature_dim)
+                ).view(bs, top_k, inc)
+                pred_local = head_logits[:, 0, :].argmax(dim=1)  # [B] in 0..inc-1
+                block_start = torch.tensor(
+                    [starts[t] for t in true_task.tolist()], device=self._device
+                )
+                true_local = targets - block_start
+                correct += (pred_local == true_local).sum().item()
+                total += bs
+        return 100.0 * correct / max(total, 1)
 
     def _save_tosca(self):
         path = f"tosca/task{self._cur_task}.pth"
