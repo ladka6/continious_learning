@@ -45,10 +45,17 @@ class Learner(BaseLearner):
         # Shared random projection P + per-task Gram/class-sum so lambda stays
         # re-solvable at eval time (free lambda sweep, no retraining).
         self._use_ridge = bool(self.args.get("use_ridge", False))
+        # "per_task": one ridge head per task over the gate's routed pool.
+        # "global": a single RanPAC-style ridge over ALL classes on the shared
+        # frozen features -- decorrelates across tasks, no gate/experts at eval.
+        self._ridge_scope = str(self.args.get("ridge_scope", "per_task"))
         self._ridge_P = None  # [feat_dim, M] fixed random projection
         self._ridge_G = {}  # task_idx -> [M, M]  (Phi^T Phi)
         self._ridge_C = {}  # task_idx -> [M, inc] (Phi^T Y_onehot)
         self._ridge_W_cache = {}  # (task_idx, lambda) -> [M, inc]
+        # Global-scope running accumulators (shared frozen-feature space).
+        self._ridge_G_global = None  # [M, M]
+        self._ridge_C_global = None  # [M, total_classes]
 
     @property
     def _gate_feature_dim(self):
@@ -623,6 +630,67 @@ class Learner(BaseLearner):
             out_logits = torch.where(routed_true.unsqueeze(1), keep, out_logits)
         return out_logits
 
+    def _accumulate_global_ridge(self, frozen, labels):
+        """RanPAC-style single classifier: accumulate one shared Gram
+        G = Phi^T Phi and class-sum C = Phi^T Y over ALL classes, in the frozen
+        (pre-tosca) feature space. Decorrelates across tasks -- no gate, no
+        experts at inference. Grows C's columns as new classes arrive."""
+        total = self._total_classes
+        frozen = frozen.to(self._device)
+        labels = labels.to(self._device).long()
+        phi = self._ridge_features(frozen)  # [N, M]
+        onehot = torch.zeros(phi.size(0), total, device=self._device)
+        onehot[torch.arange(phi.size(0), device=self._device), labels] = 1.0
+        G = (phi.t() @ phi).float()
+        C = (phi.t() @ onehot).float()
+        if self._ridge_G_global is None:
+            self._ridge_G_global = G
+            self._ridge_C_global = C
+        else:
+            self._ridge_G_global = self._ridge_G_global + G
+            prev = self._ridge_C_global
+            grown = torch.zeros(prev.size(0), total, device=self._device)
+            grown[:, : prev.size(1)] = prev
+            self._ridge_C_global = grown + C
+        self._ridge_W_cache.clear()
+        logging.info(
+            "Global ridge accumulated Task %s: M=%d, N=%d, classes=%d.",
+            self._cur_task,
+            phi.size(1),
+            phi.size(0),
+            total,
+        )
+
+    def _global_ridge_weight(self, lam):
+        key = ("__global__", float(lam))
+        W = self._ridge_W_cache.get(key)
+        if W is None:
+            G = self._ridge_G_global.double()
+            C = self._ridge_C_global.double()
+            eye = torch.eye(G.size(0), device=G.device, dtype=G.dtype)
+            W = torch.linalg.solve(G + float(lam) * eye, C).float()
+            self._ridge_W_cache[key] = W
+        return W
+
+    def _get_global_ridge_logits(self, inputs, oracle_tasks=None, lam=None):
+        """Single global ridge over all classes on frozen features. argmax over
+        every class -- task-id free (this is the RanPAC path). ``oracle_tasks``
+        restricts to the true task's block for the within-task reference."""
+        if lam is None:
+            lam = float(self.args.get("ridge_lambda", 1e4))
+        vit = self._extract_backbone_features(inputs)
+        logits = self._ridge_features(vit) @ self._global_ridge_weight(lam)
+        if oracle_tasks is not None:
+            inc = self._classes_per_task()
+            device = inputs.device
+            starts = torch.tensor([s for s, _ in self._task_ranges], device=device)
+            offsets = torch.arange(inc, device=device)
+            block = starts[oracle_tasks.to(device)].unsqueeze(1) + offsets.unsqueeze(0)
+            keep = torch.full_like(logits, float("-inf"))
+            keep.scatter_(1, block, logits.gather(1, block))
+            logits = keep
+        return logits
+
     def _eval_ridge_sweep(self, loader):
         """Re-solve ridge for several lambda in one pass (lambda is eval-only
         once G_t/C_t are stored) and report joint-argmax top1 + oracle."""
@@ -633,17 +701,20 @@ class Learner(BaseLearner):
         oracle_lam = float(self.args.get("ridge_lambda", 1e4))
         correct["oracle"] = 0
         total = 0
+        ridge_logits = (
+            self._get_global_ridge_logits
+            if self._ridge_scope == "global"
+            else self._get_routed_ridge_logits
+        )
         with torch.no_grad():
             for _, inputs, targets in loader:
                 inputs = inputs.to(self._device)
                 targets = targets.long().to(self._device)
                 for lam in lambdas:
-                    out = self._get_routed_ridge_logits(inputs, lam=lam)
+                    out = ridge_logits(inputs, lam=lam)
                     correct[lam] += (out.argmax(1) == targets).sum().item()
                 true_task = self._true_task_from_targets(targets)
-                out = self._get_routed_ridge_logits(
-                    inputs, oracle_tasks=true_task, lam=oracle_lam
-                )
+                out = ridge_logits(inputs, oracle_tasks=true_task, lam=oracle_lam)
                 correct["oracle"] += (out.argmax(1) == targets).sum().item()
                 total += targets.size(0)
         return {k: 100.0 * c / max(total, 1) for k, c in correct.items()}
@@ -655,14 +726,22 @@ class Learner(BaseLearner):
     def replace_fc(self):
         self._network.eval()
         self._load_tosca(self._cur_task)
+        need_frozen = self._use_ridge and self._ridge_scope == "global"
         embedding_list = []
+        frozen_list = []
         label_list = []
         with torch.no_grad():
             for _, data, label in self.train_loader_for_protonet:
                 data = data.to(self._device)
                 label = label.long().to(self._device)
-                embedding = self._network.backbone(data)
-                embedding_list.append(embedding.cpu())
+                if need_frozen:
+                    vit = self._extract_backbone_features(data)
+                    frozen_list.append(vit.cpu())
+                    embedding_list.append(
+                        self._get_backbone().forward_tosca(vit).cpu()
+                    )
+                else:
+                    embedding_list.append(self._network.backbone(data).cpu())
                 label_list.append(label.cpu())
         embedding_list = torch.cat(embedding_list, dim=0)
         label_list = torch.cat(label_list, dim=0)
@@ -674,11 +753,15 @@ class Learner(BaseLearner):
             proto = embedding.mean(0)
             self._network.fc.weight.data[class_index] = proto
 
-        # Fit this task's ridge head from the same real (tosca-transformed)
-        # embeddings -- no extra data pass, exemplar-free (only Gram/class-sum
-        # stored, never raw samples).
+        # Fit ridge from the same real features -- no extra data pass,
+        # exemplar-free (only Gram/class-sum stored, never raw samples).
         if self._use_ridge:
-            self._fit_ridge_head(embedding_list, label_list)
+            if self._ridge_scope == "global":
+                self._accumulate_global_ridge(
+                    torch.cat(frozen_list, dim=0), label_list
+                )
+            else:
+                self._fit_ridge_head(embedding_list, label_list)
 
     def get_optimizer(self, lr):
         if self.args["optimizer"] == "sgd":
@@ -848,7 +931,11 @@ class Learner(BaseLearner):
                 oracle_tasks = (
                     self._true_task_from_targets(targets) if oracle else None
                 )
-                if self._use_ridge:
+                if self._use_ridge and self._ridge_scope == "global":
+                    outputs = self._get_global_ridge_logits(
+                        inputs, oracle_tasks=oracle_tasks
+                    )
+                elif self._use_ridge:
                     outputs = self._get_routed_ridge_logits(
                         inputs, oracle_tasks=oracle_tasks
                     )
