@@ -39,5 +39,17 @@
   "synthetic_per_class": 500,
   "gate_min_variance": 1e-06,
   "gate_normalize_features": true,
-  "gate_top_k": 5
+  "gate_top_k": 5,
+  "use_ridge": true,
+  "ridge_proj_dim": 5000,
+  "ridge_lambda": 10000.0,
+  "ridge_normalize": true,
+  "ridge_activation": "relu",
+  "ridge_lambda_sweep": [
+    10,
+    100,
+    1000,
+    10000,
+    100000
+  ]
 }

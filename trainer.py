@@ -218,6 +218,18 @@ def _log_gate_metrics(task, gate_accy, eval_wall_seconds):
             )
         )
 
+    ridge_sweep = gate_accy.get("ridge_sweep")
+    if ridge_sweep:
+        oracle = ridge_sweep.get("oracle", 0.0)
+        lams = [(k, v) for k, v in ridge_sweep.items() if k != "oracle"]
+        lams.sort(key=lambda kv: kv[1], reverse=True)
+        summary = ", ".join("lam={:g}:{:.2f}".format(k, v) for k, v in lams)
+        logging.info(
+            "Ridge sweep (top-{}, joint) => {} | oracle={:.2f} (ceiling)".format(
+                gate_accy.get("top_k", 1), summary, oracle
+            )
+        )
+
     if "eval_seconds" in gate_accy:
         logging.info(
             "Gate routing eval time: {:.2f}s ({:.3f} ms/sample)".format(
