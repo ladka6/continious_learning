@@ -206,6 +206,15 @@ def _log_gate_metrics(task, gate_accy, eval_wall_seconds):
             )
         )
 
+    if "oracle_select_top1" in gate_accy:
+        logging.info(
+            "Oracle-selection CNN top1: {:.2f}% (true expert always wins among "
+            "routed top-{}; ceiling = recall@k x within-expert acc)".format(
+                gate_accy["oracle_select_top1"],
+                gate_accy.get("top_k", 1),
+            )
+        )
+
     if "eval_seconds" in gate_accy:
         logging.info(
             "Gate routing eval time: {:.2f}s ({:.3f} ms/sample)".format(

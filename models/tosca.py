@@ -372,18 +372,35 @@ class Learner(BaseLearner):
         )
         logging.info(f"Gate parameters saved to {path}.")
 
-    def _get_routed_prototype_logits(self, inputs):
+    def _get_routed_prototype_logits(self, inputs, oracle_tasks=None):
         """TOSCA-paper inference restricted to the gate's top-k experts.
 
         One frozen-backbone forward produces shared ViT features. The gate
         selects k candidate tasks per sample; each candidate's tosca transforms
-        the shared features and the cosine prototype classifier (fc, filled by
-        replace_fc with real class means) scores ALL seen classes from that
-        expert's feature space. Following the paper, the winning expert is the
-        one whose class distribution has minimum Shannon entropy, and its
-        logits are returned. With top_k >= num_tasks this is exactly the
-        paper's run-every-expert inference; smaller k trades a little recall
-        for k instead of N expert forwards."""
+        the shared features and the cosine prototype classifier (fc) scores that
+        candidate's classes.
+
+        Two robustness changes over naive full-class entropy minimization,
+        which was found to degrade sharply as k grows (impostor experts win the
+        entropy contest more often with more candidates):
+
+          1. Own-block restriction: a class prototype only lives in the feature
+             space of the expert that built it (replace_fc runs per task), so a
+             candidate is scored ONLY over its own task's classes. Cross-space
+             logits (this expert's feature vs another task's prototype) are
+             discarded -- they were the main source of impostor confidence.
+          2. Gate-prior selection: instead of picking purely by minimum entropy,
+             the winning candidate maximizes
+                 select_gate_weight * log p_gate(task)
+                 - select_entropy_weight * H(own-block softmax),
+             i.e. the gate's own ranking is used as an informative prior rather
+             than discarded after the top-k cut.
+
+        The prediction is the winning expert's own-block class scores scattered
+        to their global ids (all other classes -inf). ``oracle_tasks`` ([B] true
+        task ids), when given, forces the true task to win selection whenever it
+        is inside the routed top-k -- this measures the recall@k x within-expert
+        ceiling (perfect selection among routed experts)."""
         if self._gate is None or self._gate.num_tasks < (self._cur_task + 1):
             raise RuntimeError(
                 "Gate is not initialized or out of sync with current task count."
@@ -395,14 +412,20 @@ class Learner(BaseLearner):
 
         num_tasks = self._cur_task + 1
         eff_k = max(1, min(self._top_k, num_tasks))
+        inc = self._classes_per_task()
         batch_size = inputs.size(0)
         total_classes = self._network.fc.out_features
-        topk_tasks = torch.topk(gate_logits, eff_k, dim=1).indices  # [B, eff_k]
+        device = inputs.device
+        gate_weight = float(self.args.get("select_gate_weight", 1.0))
+        entropy_weight = float(self.args.get("select_entropy_weight", 1.0))
 
-        # Each candidate expert's full-class cosine logits, per sample.
-        cand_logits = torch.zeros(
-            batch_size, eff_k, total_classes, device=inputs.device
+        topk_tasks = torch.topk(gate_logits, eff_k, dim=1).indices  # [B, eff_k]
+        starts = torch.tensor(
+            [s for s, _ in self._task_ranges], device=device
         )
+
+        # Per-candidate own-block cosine logits [B, eff_k, inc].
+        own_logits = torch.zeros(batch_size, eff_k, inc, device=device)
         for task_idx in torch.unique(topk_tasks).tolist():
             task_idx = int(task_idx)
             sel = topk_tasks == task_idx  # [B, eff_k]
@@ -410,19 +433,40 @@ class Learner(BaseLearner):
             self._load_tosca(task_idx)
             task_features = self._get_backbone().forward_tosca(vit_features[rows])
             logits = self._network.fc(task_features)["logits"]  # [rows, C]
-            full = torch.zeros(batch_size, total_classes, device=inputs.device)
-            full[rows] = logits
+            start = int(starts[task_idx].item())
+            block = logits[:, start : start + inc]  # own classes only
+            block_full = torch.zeros(batch_size, inc, device=device)
+            block_full[rows] = block
             for s in range(eff_k):
                 slot_mask = sel[:, s]
                 if slot_mask.any():
-                    cand_logits[slot_mask, s, :] = full[slot_mask]
+                    own_logits[slot_mask, s, :] = block_full[slot_mask]
 
-        # Entropy minimization over candidates: the correct expert is the most
-        # confident one (paper Eq. for prediction).
-        probs = torch.softmax(cand_logits, dim=2)
+        # Selection score: gate log-prior minus own-block entropy.
+        probs = torch.softmax(own_logits, dim=2)
         entropy = -(probs * torch.log(probs.clamp_min(1e-12))).sum(dim=2)  # [B, eff_k]
-        best_slot = entropy.argmin(dim=1)  # [B]
-        return cand_logits[torch.arange(batch_size, device=inputs.device), best_slot]
+        gate_logprob = torch.log_softmax(gate_logits, dim=1).gather(
+            1, topk_tasks
+        )  # [B, eff_k]
+        score = gate_weight * gate_logprob - entropy_weight * entropy
+
+        if oracle_tasks is not None:
+            oracle_tasks = oracle_tasks.to(device)
+            is_true = topk_tasks == oracle_tasks.unsqueeze(1)  # [B, eff_k]
+            score = torch.where(is_true, torch.full_like(score, float("inf")), score)
+
+        arange = torch.arange(batch_size, device=device)
+        best_slot = score.argmax(dim=1)  # [B]
+        win_task = topk_tasks[arange, best_slot]  # [B]
+        win_logits = own_logits[arange, best_slot, :]  # [B, inc]
+
+        out_logits = torch.full(
+            (batch_size, total_classes), float("-inf"), device=device
+        )
+        offsets = torch.arange(inc, device=device)
+        idx = starts[win_task].unsqueeze(1) + offsets.unsqueeze(0)  # [B, inc]
+        out_logits.scatter_(1, idx, win_logits)
+        return out_logits
 
     def after_task(self):
         self._network.backbone.reset_tosca()
@@ -579,24 +623,41 @@ class Learner(BaseLearner):
         nme_accy = None
         gate_accy = self._eval_gate_routing(self.test_loader)
         eval_seconds = time.perf_counter() - eval_start
+        # Ceiling: perfect selection among the routed top-k experts. The gap to
+        # cnn_accy is pure selection error; the gap from here to 100 is routing
+        # recall + within-expert error.
+        oracle_pred, oracle_true = self._eval_cnn(self.test_loader, oracle=True)
+        oracle_accy = self._evaluate(oracle_pred, oracle_true)
         num_samples = len(self.test_loader.dataset)
         gate_flops = self._compute_gate_routing_flops(
             batch_size=self.test_loader.batch_size
         )
         if gate_accy is not None:
+            gate_accy["oracle_select_top1"] = oracle_accy["top1"]
             gate_accy["eval_seconds"] = eval_seconds
             gate_accy["ms_per_sample"] = 1000.0 * eval_seconds / max(num_samples, 1)
             gate_accy["routing_flops"] = gate_flops
         return cnn_accy, nme_accy, gate_accy
 
-    def _eval_cnn(self, loader):
+    def _true_task_from_targets(self, targets):
+        true_task = torch.zeros_like(targets)
+        for t, (start, end) in enumerate(self._task_ranges):
+            true_task[(targets >= start) & (targets < end)] = t
+        return true_task
+
+    def _eval_cnn(self, loader, oracle=False):
         self._network.eval()
         y_pred, y_true = [], []
 
         for _, (_, inputs, targets) in enumerate(loader):
             inputs, targets = inputs.to(self._device), targets.long().to(self._device)
             with torch.no_grad():
-                outputs = self._get_routed_prototype_logits(inputs)
+                oracle_tasks = (
+                    self._true_task_from_targets(targets) if oracle else None
+                )
+                outputs = self._get_routed_prototype_logits(
+                    inputs, oracle_tasks=oracle_tasks
+                )
             predicts = torch.topk(
                 outputs, k=self.topk, dim=1, largest=True, sorted=True
             )[1]
