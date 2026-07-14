@@ -372,35 +372,20 @@ class Learner(BaseLearner):
         )
         logging.info(f"Gate parameters saved to {path}.")
 
-    def _get_routed_prototype_logits(self, inputs, oracle_tasks=None):
-        """TOSCA-paper inference restricted to the gate's top-k experts.
+    def _routed_candidates(self, inputs):
+        """Expensive shared step of inference: one frozen-backbone forward, gate
+        top-k routing, and each routed expert's OWN-block cosine logits.
 
-        One frozen-backbone forward produces shared ViT features. The gate
-        selects k candidate tasks per sample; each candidate's tosca transforms
-        the shared features and the cosine prototype classifier (fc) scores that
-        candidate's classes.
+        Only a candidate's own task classes are scored -- a prototype lives in
+        the feature space of the expert that built it (replace_fc runs per task),
+        so this-expert-feature vs other-task-prototype logits are meaningless and
+        were the main source of impostor confidence when k grew.
 
-        Two robustness changes over naive full-class entropy minimization,
-        which was found to degrade sharply as k grows (impostor experts win the
-        entropy contest more often with more candidates):
-
-          1. Own-block restriction: a class prototype only lives in the feature
-             space of the expert that built it (replace_fc runs per task), so a
-             candidate is scored ONLY over its own task's classes. Cross-space
-             logits (this expert's feature vs another task's prototype) are
-             discarded -- they were the main source of impostor confidence.
-          2. Gate-prior selection: instead of picking purely by minimum entropy,
-             the winning candidate maximizes
-                 select_gate_weight * log p_gate(task)
-                 - select_entropy_weight * H(own-block softmax),
-             i.e. the gate's own ranking is used as an informative prior rather
-             than discarded after the top-k cut.
-
-        The prediction is the winning expert's own-block class scores scattered
-        to their global ids (all other classes -inf). ``oracle_tasks`` ([B] true
-        task ids), when given, forces the true task to win selection whenever it
-        is inside the routed top-k -- this measures the recall@k x within-expert
-        ceiling (perfect selection among routed experts)."""
+        Returns:
+          own_logits    [B, eff_k, inc]  own-block cosine logits per candidate
+          gate_logprob  [B, eff_k]       gate log-prob of each candidate task
+          topk_tasks    [B, eff_k]       candidate task ids (gate-rank order)
+        """
         if self._gate is None or self._gate.num_tasks < (self._cur_task + 1):
             raise RuntimeError(
                 "Gate is not initialized or out of sync with current task count."
@@ -414,17 +399,11 @@ class Learner(BaseLearner):
         eff_k = max(1, min(self._top_k, num_tasks))
         inc = self._classes_per_task()
         batch_size = inputs.size(0)
-        total_classes = self._network.fc.out_features
         device = inputs.device
-        gate_weight = float(self.args.get("select_gate_weight", 1.0))
-        entropy_weight = float(self.args.get("select_entropy_weight", 1.0))
 
         topk_tasks = torch.topk(gate_logits, eff_k, dim=1).indices  # [B, eff_k]
-        starts = torch.tensor(
-            [s for s, _ in self._task_ranges], device=device
-        )
+        starts = torch.tensor([s for s, _ in self._task_ranges], device=device)
 
-        # Per-candidate own-block cosine logits [B, eff_k, inc].
         own_logits = torch.zeros(batch_size, eff_k, inc, device=device)
         for task_idx in torch.unique(topk_tasks).tolist():
             task_idx = int(task_idx)
@@ -442,31 +421,94 @@ class Learner(BaseLearner):
                 if slot_mask.any():
                     own_logits[slot_mask, s, :] = block_full[slot_mask]
 
-        # Selection score: gate log-prior minus own-block entropy.
+        gate_logprob = torch.log_softmax(gate_logits, dim=1).gather(1, topk_tasks)
+        return own_logits, gate_logprob, topk_tasks
+
+    def _selection_score(self, own_logits, gate_logprob, rule):
+        """Per-candidate selection score [B, eff_k] under a given rule; the
+        highest-scoring candidate expert wins and its class is predicted."""
         probs = torch.softmax(own_logits, dim=2)
-        entropy = -(probs * torch.log(probs.clamp_min(1e-12))).sum(dim=2)  # [B, eff_k]
-        gate_logprob = torch.log_softmax(gate_logits, dim=1).gather(
-            1, topk_tasks
-        )  # [B, eff_k]
-        score = gate_weight * gate_logprob - entropy_weight * entropy
+        entropy = -(probs * torch.log(probs.clamp_min(1e-12))).sum(dim=2)
+        if rule == "entropy":
+            return -entropy
+        if rule == "max_cosine":
+            # nearest-prototype (NCM/RanPAC) rule: pick the expert whose best
+            # own class has the highest cosine similarity. sigma is shared across
+            # experts so raw logits are directly comparable.
+            return own_logits.max(dim=2).values
+        if rule == "margin":
+            top2 = own_logits.topk(2, dim=2).values
+            return top2[..., 0] - top2[..., 1]
+        if rule == "entropy_gate":
+            gw = float(self.args.get("select_gate_weight", 1.0))
+            ew = float(self.args.get("select_entropy_weight", 1.0))
+            return gw * gate_logprob - ew * entropy
+        if rule == "max_cosine_gate":
+            gw = float(self.args.get("select_gate_weight", 1.0))
+            return own_logits.max(dim=2).values + gw * gate_logprob
+        raise ValueError(f"Unknown selection rule: {rule}")
 
-        if oracle_tasks is not None:
-            oracle_tasks = oracle_tasks.to(device)
-            is_true = topk_tasks == oracle_tasks.unsqueeze(1)  # [B, eff_k]
-            score = torch.where(is_true, torch.full_like(score, float("inf")), score)
-
+    def _scatter_winner(self, own_logits, topk_tasks, best_slot):
+        """Scatter the winning candidate's own-block scores to global class ids
+        (all other classes -inf), so argmax stays inside the chosen expert."""
+        batch_size, _, inc = own_logits.shape
+        device = own_logits.device
+        total_classes = self._network.fc.out_features
+        starts = torch.tensor([s for s, _ in self._task_ranges], device=device)
         arange = torch.arange(batch_size, device=device)
-        best_slot = score.argmax(dim=1)  # [B]
-        win_task = topk_tasks[arange, best_slot]  # [B]
-        win_logits = own_logits[arange, best_slot, :]  # [B, inc]
-
+        win_task = topk_tasks[arange, best_slot]
+        win_logits = own_logits[arange, best_slot, :]
         out_logits = torch.full(
             (batch_size, total_classes), float("-inf"), device=device
         )
         offsets = torch.arange(inc, device=device)
-        idx = starts[win_task].unsqueeze(1) + offsets.unsqueeze(0)  # [B, inc]
+        idx = starts[win_task].unsqueeze(1) + offsets.unsqueeze(0)
         out_logits.scatter_(1, idx, win_logits)
         return out_logits
+
+    def _get_routed_prototype_logits(self, inputs, oracle_tasks=None):
+        """Full routed-prototype inference under the configured selection rule.
+
+        ``oracle_tasks`` ([B] true task ids), when given, forces the true task to
+        win selection whenever it is inside the routed top-k -- the recall@k x
+        within-expert ceiling (perfect selection among routed experts)."""
+        own_logits, gate_logprob, topk_tasks = self._routed_candidates(inputs)
+        rule = str(self.args.get("select_rule", "entropy_gate"))
+        score = self._selection_score(own_logits, gate_logprob, rule)
+        if oracle_tasks is not None:
+            oracle_tasks = oracle_tasks.to(score.device)
+            is_true = topk_tasks == oracle_tasks.unsqueeze(1)
+            score = torch.where(is_true, torch.full_like(score, float("inf")), score)
+        best_slot = score.argmax(dim=1)
+        return self._scatter_winner(own_logits, topk_tasks, best_slot)
+
+    def _eval_selection_sweep(self, loader):
+        """Evaluate every selection rule (plus the oracle) in ONE pass, reusing
+        a single expert forward per batch. Selection is eval-only, so this finds
+        the best operating point without retraining. Returns rule -> top1%."""
+        rules = ["entropy_gate", "entropy", "max_cosine", "max_cosine_gate", "margin"]
+        correct = {r: 0 for r in rules}
+        correct["oracle"] = 0
+        total = 0
+        with torch.no_grad():
+            for _, inputs, targets in loader:
+                inputs = inputs.to(self._device)
+                targets = targets.long().to(self._device)
+                true_task = self._true_task_from_targets(targets)
+                own_logits, gate_logprob, topk_tasks = self._routed_candidates(inputs)
+                for rule in rules:
+                    score = self._selection_score(own_logits, gate_logprob, rule)
+                    best_slot = score.argmax(dim=1)
+                    out = self._scatter_winner(own_logits, topk_tasks, best_slot)
+                    correct[rule] += (out.argmax(1) == targets).sum().item()
+                # oracle: force true task to win when routed
+                score = self._selection_score(own_logits, gate_logprob, "entropy_gate")
+                is_true = topk_tasks == true_task.unsqueeze(1)
+                score = torch.where(is_true, torch.full_like(score, float("inf")), score)
+                out = self._scatter_winner(own_logits, topk_tasks, score.argmax(dim=1))
+                correct["oracle"] += (out.argmax(1) == targets).sum().item()
+                total += targets.size(0)
+        return {r: 100.0 * c / max(total, 1) for r, c in correct.items()}
 
     def after_task(self):
         self._network.backbone.reset_tosca()
@@ -623,17 +665,17 @@ class Learner(BaseLearner):
         nme_accy = None
         gate_accy = self._eval_gate_routing(self.test_loader)
         eval_seconds = time.perf_counter() - eval_start
-        # Ceiling: perfect selection among the routed top-k experts. The gap to
-        # cnn_accy is pure selection error; the gap from here to 100 is routing
-        # recall + within-expert error.
-        oracle_pred, oracle_true = self._eval_cnn(self.test_loader, oracle=True)
-        oracle_accy = self._evaluate(oracle_pred, oracle_true)
+        # Sweep every selection rule + oracle in one pass (eval-only, no retrain).
+        # oracle is the recall@k x within-expert ceiling; gap to it is pure
+        # selection error.
+        selection_sweep = self._eval_selection_sweep(self.test_loader)
         num_samples = len(self.test_loader.dataset)
         gate_flops = self._compute_gate_routing_flops(
             batch_size=self.test_loader.batch_size
         )
         if gate_accy is not None:
-            gate_accy["oracle_select_top1"] = oracle_accy["top1"]
+            gate_accy["oracle_select_top1"] = selection_sweep.get("oracle")
+            gate_accy["selection_sweep"] = selection_sweep
             gate_accy["eval_seconds"] = eval_seconds
             gate_accy["ms_per_sample"] = 1000.0 * eval_seconds / max(num_samples, 1)
             gate_accy["routing_flops"] = gate_flops

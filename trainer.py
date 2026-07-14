@@ -206,12 +206,15 @@ def _log_gate_metrics(task, gate_accy, eval_wall_seconds):
             )
         )
 
-    if "oracle_select_top1" in gate_accy:
+    sweep = gate_accy.get("selection_sweep")
+    if sweep:
+        oracle = sweep.get("oracle", 0.0)
+        rules = [(r, v) for r, v in sweep.items() if r != "oracle"]
+        rules.sort(key=lambda kv: kv[1], reverse=True)
+        summary = ", ".join("{}={:.2f}".format(r, v) for r, v in rules)
         logging.info(
-            "Oracle-selection CNN top1: {:.2f}% (true expert always wins among "
-            "routed top-{}; ceiling = recall@k x within-expert acc)".format(
-                gate_accy["oracle_select_top1"],
-                gate_accy.get("top_k", 1),
+            "Selection sweep (top-{}) => {} | oracle={:.2f} (ceiling)".format(
+                gate_accy.get("top_k", 1), summary, oracle
             )
         )
 
