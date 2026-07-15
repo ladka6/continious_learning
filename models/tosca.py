@@ -581,34 +581,22 @@ class Learner(BaseLearner):
             self._ridge_W_cache[key] = W
         return W
 
-    def _get_routed_ridge_logits(self, inputs, oracle_tasks=None, lam=None):
-        """Ridge inference over the gate's routed top-k pool. Each routed
-        expert's ridge scores are scattered to its global classes; argmax over
-        the union is a JOINT decision -- no hard task-id selection. Ridge
-        regresses to one-hot, so scores are cross-expert comparable (an
-        out-of-task sample fed to the wrong expert scores ~0).
-
-        ``oracle_tasks`` masks the output to the true task's block whenever it
-        is routed -> the recall@k x within-expert-ridge ceiling."""
-        if lam is None:
-            lam = float(self.args.get("ridge_lambda", 1e4))
-        self._gate.eval()
-        vit_features = self._extract_backbone_features(inputs)
-        gate_logits = self._gate(self._prepare_gate_features(vit_features))
-
-        num_tasks = self._cur_task + 1
-        eff_k = max(1, min(self._top_k, num_tasks))
+    def _routed_ridge_from_tasks(self, vit_features, topk_tasks, lam, oracle_tasks=None):
+        """Given shared ViT features and a per-sample set of candidate tasks
+        [B, k] (from ANY router -- the gate or the global ridge), score each
+        routed expert's classes with its per-task ridge head and scatter to the
+        global class union. Argmax over the union is a JOINT decision -- ridge
+        regresses to one-hot, so scores are cross-expert comparable."""
         inc = self._classes_per_task()
-        batch_size = inputs.size(0)
-        device = inputs.device
+        device = vit_features.device
+        batch_size = vit_features.size(0)
         total_classes = self._network.fc.out_features
-        topk_tasks = torch.topk(gate_logits, eff_k, dim=1).indices  # [B, eff_k]
         starts = torch.tensor([s for s, _ in self._task_ranges], device=device)
+        offsets = torch.arange(inc, device=device)
 
         out_logits = torch.full(
             (batch_size, total_classes), float("-inf"), device=device
         )
-        offsets = torch.arange(inc, device=device)
         for task_idx in torch.unique(topk_tasks).tolist():
             task_idx = int(task_idx)
             if task_idx not in self._ridge_G:
@@ -621,14 +609,60 @@ class Learner(BaseLearner):
             out_logits[row_ids, start : start + inc] = scores
 
         if oracle_tasks is not None:
-            # Keep only the true task's block when it was routed.
             oracle_tasks = oracle_tasks.to(device)
             routed_true = (topk_tasks == oracle_tasks.unsqueeze(1)).any(dim=1)
-            block = starts[oracle_tasks].unsqueeze(1) + offsets.unsqueeze(0)  # [B, inc]
+            block = starts[oracle_tasks].unsqueeze(1) + offsets.unsqueeze(0)
             keep = torch.full((batch_size, total_classes), float("-inf"), device=device)
             keep.scatter_(1, block, out_logits.gather(1, block))
             out_logits = torch.where(routed_true.unsqueeze(1), keep, out_logits)
         return out_logits
+
+    def _gate_topk_tasks(self, vit_features):
+        self._gate.eval()
+        gate_logits = self._gate(self._prepare_gate_features(vit_features))
+        eff_k = max(1, min(self._top_k, self._cur_task + 1))
+        return torch.topk(gate_logits, eff_k, dim=1).indices  # [B, eff_k]
+
+    def _task_scores_from_logits(self, logits):
+        """Class logits [B, C] -> per-task score [B, num_tasks] (max class in
+        each task's block). Used to route from the global ridge's own output."""
+        device = logits.device
+        scores = torch.full(
+            (logits.size(0), len(self._task_ranges)), float("-inf"), device=device
+        )
+        for t, (start, end) in enumerate(self._task_ranges):
+            scores[:, t] = logits[:, start:end].max(dim=1).values
+        return scores
+
+    def _get_routed_ridge_logits(self, inputs, oracle_tasks=None, lam=None):
+        """Gate routes top-k -> per-task ridge classifies within the pool."""
+        if lam is None:
+            lam = float(self.args.get("ridge_lambda", 1e4))
+        vit_features = self._extract_backbone_features(inputs)
+        topk_tasks = self._gate_topk_tasks(vit_features)
+        return self._routed_ridge_from_tasks(
+            vit_features, topk_tasks, lam, oracle_tasks
+        )
+
+    def _get_global_routed_ridge_logits(
+        self, inputs, oracle_tasks=None, lam=None, k_route=None
+    ):
+        """Method 2: the GLOBAL ridge routes (its cross-task discrimination is
+        far stronger than the gate's), then the per-task TOSCA expert ridge
+        classifies within the chosen task(s). Replaces the weak gate with the
+        global ridge's own task ranking."""
+        if lam is None:
+            lam = float(self.args.get("ridge_lambda", 1e4))
+        if k_route is None:
+            k_route = int(self.args.get("ridge_route_topk", 1))
+        vit_features = self._extract_backbone_features(inputs)
+        global_logits = self._ridge_features(vit_features) @ self._global_ridge_weight(lam)
+        task_scores = self._task_scores_from_logits(global_logits)
+        eff_k = max(1, min(k_route, self._cur_task + 1))
+        topk_tasks = torch.topk(task_scores, eff_k, dim=1).indices  # [B, eff_k]
+        return self._routed_ridge_from_tasks(
+            vit_features, topk_tasks, lam, oracle_tasks
+        )
 
     def _accumulate_global_ridge(self, frozen, labels):
         """RanPAC-style single classifier: accumulate one shared Gram
@@ -719,6 +753,49 @@ class Learner(BaseLearner):
                 total += targets.size(0)
         return {k: 100.0 * c / max(total, 1) for k, c in correct.items()}
 
+    def _eval_method2_sweep(self, loader):
+        """Compare, in one pass, who should route: nobody (pure global), the
+        gate, or the global ridge itself (@ several route-k). oracle = route to
+        the TRUE task then expert ridge = within-expert ceiling. Tells us
+        directly whether the TOSCA experts add anything over pure global."""
+        lam = float(self.args.get("ridge_lambda", 1e4))
+        k_sweep = [int(k) for k in self.args.get("ridge_route_topk_sweep", [1, 2, 5])]
+        keys = (
+            ["pure_global", "gate_routed"]
+            + ["global_route@{}".format(k) for k in k_sweep]
+            + ["oracle"]
+        )
+        correct = {k: 0 for k in keys}
+        total = 0
+        with torch.no_grad():
+            for _, inputs, targets in loader:
+                inputs = inputs.to(self._device)
+                targets = targets.long().to(self._device)
+                vit = self._extract_backbone_features(inputs)
+                gl = self._ridge_features(vit) @ self._global_ridge_weight(lam)
+                correct["pure_global"] += (gl.argmax(1) == targets).sum().item()
+
+                gate_topk = self._gate_topk_tasks(vit)
+                out = self._routed_ridge_from_tasks(vit, gate_topk, lam)
+                correct["gate_routed"] += (out.argmax(1) == targets).sum().item()
+
+                task_scores = self._task_scores_from_logits(gl)
+                for k in k_sweep:
+                    ek = max(1, min(k, self._cur_task + 1))
+                    tk = torch.topk(task_scores, ek, dim=1).indices
+                    out = self._routed_ridge_from_tasks(vit, tk, lam)
+                    correct["global_route@{}".format(k)] += (
+                        (out.argmax(1) == targets).sum().item()
+                    )
+
+                true_task = self._true_task_from_targets(targets)
+                out = self._routed_ridge_from_tasks(
+                    vit, true_task.unsqueeze(1), lam
+                )
+                correct["oracle"] += (out.argmax(1) == targets).sum().item()
+                total += targets.size(0)
+        return {k: 100.0 * c / max(total, 1) for k, c in correct.items()}
+
     def after_task(self):
         self._network.backbone.reset_tosca()
         self._known_classes = self._total_classes
@@ -726,7 +803,7 @@ class Learner(BaseLearner):
     def replace_fc(self):
         self._network.eval()
         self._load_tosca(self._cur_task)
-        need_frozen = self._use_ridge and self._ridge_scope == "global"
+        need_frozen = self._use_ridge and self._ridge_scope in ("global", "global_router")
         embedding_list = []
         frozen_list = []
         label_list = []
@@ -755,12 +832,14 @@ class Learner(BaseLearner):
 
         # Fit ridge from the same real features -- no extra data pass,
         # exemplar-free (only Gram/class-sum stored, never raw samples).
+        # global_router needs BOTH: the global head (routes) and the per-task
+        # heads (classify within the routed task).
         if self._use_ridge:
-            if self._ridge_scope == "global":
+            if self._ridge_scope in ("global", "global_router"):
                 self._accumulate_global_ridge(
                     torch.cat(frozen_list, dim=0), label_list
                 )
-            else:
+            if self._ridge_scope in ("per_task", "global_router"):
                 self._fit_ridge_head(embedding_list, label_list)
 
     def get_optimizer(self, lr):
@@ -895,7 +974,9 @@ class Learner(BaseLearner):
         # Sweep the classifier's key knob + oracle in one pass (eval-only, no
         # retrain). oracle is the recall@k x within-expert ceiling; gap to it is
         # pure selection error.
-        if self._use_ridge:
+        if self._use_ridge and self._ridge_scope == "global_router":
+            method2_sweep = self._eval_method2_sweep(self.test_loader)
+        elif self._use_ridge:
             ridge_sweep = self._eval_ridge_sweep(self.test_loader)
         else:
             selection_sweep = self._eval_selection_sweep(self.test_loader)
@@ -904,7 +985,10 @@ class Learner(BaseLearner):
             batch_size=self.test_loader.batch_size
         )
         if gate_accy is not None:
-            if self._use_ridge:
+            if self._use_ridge and self._ridge_scope == "global_router":
+                gate_accy["oracle_select_top1"] = method2_sweep.get("oracle")
+                gate_accy["method2_sweep"] = method2_sweep
+            elif self._use_ridge:
                 gate_accy["oracle_select_top1"] = ridge_sweep.get("oracle")
                 gate_accy["ridge_sweep"] = ridge_sweep
             else:
@@ -933,6 +1017,10 @@ class Learner(BaseLearner):
                 )
                 if self._use_ridge and self._ridge_scope == "global":
                     outputs = self._get_global_ridge_logits(
+                        inputs, oracle_tasks=oracle_tasks
+                    )
+                elif self._use_ridge and self._ridge_scope == "global_router":
+                    outputs = self._get_global_routed_ridge_logits(
                         inputs, oracle_tasks=oracle_tasks
                     )
                 elif self._use_ridge:

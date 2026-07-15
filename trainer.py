@@ -230,6 +230,17 @@ def _log_gate_metrics(task, gate_accy, eval_wall_seconds):
             )
         )
 
+    method2_sweep = gate_accy.get("method2_sweep")
+    if method2_sweep:
+        oracle = method2_sweep.get("oracle", 0.0)
+        rows = [(k, v) for k, v in method2_sweep.items() if k != "oracle"]
+        rows.sort(key=lambda kv: kv[1], reverse=True)
+        summary = ", ".join("{}={:.2f}".format(k, v) for k, v in rows)
+        logging.info(
+            "Method-2 sweep (global routes -> expert ridge) => {} | "
+            "oracle={:.2f} (true-task expert ceiling)".format(summary, oracle)
+        )
+
     if "eval_seconds" in gate_accy:
         logging.info(
             "Gate routing eval time: {:.2f}s ({:.3f} ms/sample)".format(
