@@ -159,12 +159,15 @@ class Learner(BaseLearner):
         backbone_train_seconds = time.perf_counter() - backbone_train_start
         self._save_tosca()
 
-        feature_collection_start = time.perf_counter()
-        self._collect_current_task_gate_stats()
-        feature_collection_seconds = time.perf_counter() - feature_collection_start
-        gate_train_start = time.perf_counter()
-        self._train_gate()
-        gate_train_seconds = time.perf_counter() - gate_train_start
+        feature_collection_seconds = 0.0
+        gate_train_seconds = 0.0
+        if self._gate_enabled():
+            feature_collection_start = time.perf_counter()
+            self._collect_current_task_gate_stats()
+            feature_collection_seconds = time.perf_counter() - feature_collection_start
+            gate_train_start = time.perf_counter()
+            self._train_gate()
+            gate_train_seconds = time.perf_counter() - gate_train_start
 
         replace_fc_start = time.perf_counter()
         self.replace_fc()
@@ -193,6 +196,11 @@ class Learner(BaseLearner):
         if isinstance(self._network, torch.nn.DataParallel):
             return self._network.module.backbone
         return self._network.backbone
+
+    def _gate_enabled(self):
+        # In global_router the global ridge is the router, so the synthetic
+        # TaskGate is not trained, evaluated, or logged at all.
+        return not (self._use_ridge and self._ridge_scope == "global_router")
 
     def _set_trainable(self):
         # Adapters trainable on task 0 only, frozen afterwards.
@@ -754,14 +762,14 @@ class Learner(BaseLearner):
         return {k: 100.0 * c / max(total, 1) for k, c in correct.items()}
 
     def _eval_method2_sweep(self, loader):
-        """Compare, in one pass, who should route: nobody (pure global), the
-        gate, or the global ridge itself (@ several route-k). oracle = route to
-        the TRUE task then expert ridge = within-expert ceiling. Tells us
-        directly whether the TOSCA experts add anything over pure global."""
+        """Compare, in one pass: pure global (no routing), the global ridge as
+        router (@ several route-k), and oracle = route to the TRUE task then
+        expert ridge = within-expert ceiling. Tells us directly whether the
+        TOSCA experts add anything over pure global."""
         lam = float(self.args.get("ridge_lambda", 1e4))
         k_sweep = [int(k) for k in self.args.get("ridge_route_topk_sweep", [1, 2, 5])]
         keys = (
-            ["pure_global", "gate_routed"]
+            ["pure_global"]
             + ["global_route@{}".format(k) for k in k_sweep]
             + ["oracle"]
         )
@@ -774,10 +782,6 @@ class Learner(BaseLearner):
                 vit = self._extract_backbone_features(inputs)
                 gl = self._ridge_features(vit) @ self._global_ridge_weight(lam)
                 correct["pure_global"] += (gl.argmax(1) == targets).sum().item()
-
-                gate_topk = self._gate_topk_tasks(vit)
-                out = self._routed_ridge_from_tasks(vit, gate_topk, lam)
-                correct["gate_routed"] += (out.argmax(1) == targets).sum().item()
 
                 task_scores = self._task_scores_from_logits(gl)
                 for k in k_sweep:
@@ -945,18 +949,26 @@ class Learner(BaseLearner):
         }
 
     def _compute_gate_routing_flops(self, batch_size=1):
-        input_dim = int(self._gate_feature_dim)
-        hidden_dim = int(self.args.get("gate_hidden_dim", 0))
         num_tasks = max(self._cur_task + 1, 1)
 
-        if hidden_dim > 0:
-            hidden_flops = 2 * input_dim * hidden_dim + hidden_dim
-            classifier_flops = 2 * hidden_dim * num_tasks
+        if self._use_ridge and self._ridge_scope == "global_router":
+            # Router = global ridge: normalize + random projection (768->M) +
+            # ReLU + linear head to all seen classes. (Expert cost is separate.)
+            feat_dim = int(self._network.feature_dim)
+            M = int(self.args.get("ridge_proj_dim", 5000))
+            classes = int(self._total_classes)
+            per_sample_flops = feat_dim + 2 * feat_dim * M + M + 2 * M * classes
         else:
-            hidden_flops = 0
-            classifier_flops = 2 * input_dim * num_tasks
+            input_dim = int(self._gate_feature_dim)
+            hidden_dim = int(self.args.get("gate_hidden_dim", 0))
+            if hidden_dim > 0:
+                hidden_flops = 2 * input_dim * hidden_dim + hidden_dim
+                classifier_flops = 2 * hidden_dim * num_tasks
+            else:
+                hidden_flops = 0
+                classifier_flops = 2 * input_dim * num_tasks
+            per_sample_flops = hidden_flops + classifier_flops
 
-        per_sample_flops = hidden_flops + classifier_flops
         return {
             "per_sample": int(per_sample_flops),
             "per_batch": int(per_sample_flops * batch_size),
@@ -969,35 +981,31 @@ class Learner(BaseLearner):
         y_pred, y_true = self._eval_cnn(self.test_loader)
         cnn_accy = self._evaluate(y_pred, y_true)
         nme_accy = None
-        gate_accy = self._eval_gate_routing(self.test_loader)
+        gate_accy = self._eval_gate_routing(self.test_loader)  # None when gate off
         eval_seconds = time.perf_counter() - eval_start
         # Sweep the classifier's key knob + oracle in one pass (eval-only, no
         # retrain). oracle is the recall@k x within-expert ceiling; gap to it is
-        # pure selection error.
+        # pure selection error. global_router reports only the current config's
+        # number (the CNN curve = global_route@ridge_route_topk), no sweep.
         if self._use_ridge and self._ridge_scope == "global_router":
-            method2_sweep = self._eval_method2_sweep(self.test_loader)
+            perf_sweep, sweep_key = None, None
         elif self._use_ridge:
-            ridge_sweep = self._eval_ridge_sweep(self.test_loader)
+            perf_sweep, sweep_key = self._eval_ridge_sweep(self.test_loader), "ridge_sweep"
         else:
-            selection_sweep = self._eval_selection_sweep(self.test_loader)
+            perf_sweep, sweep_key = self._eval_selection_sweep(self.test_loader), "selection_sweep"
         num_samples = len(self.test_loader.dataset)
         gate_flops = self._compute_gate_routing_flops(
             batch_size=self.test_loader.batch_size
         )
-        if gate_accy is not None:
-            if self._use_ridge and self._ridge_scope == "global_router":
-                gate_accy["oracle_select_top1"] = method2_sweep.get("oracle")
-                gate_accy["method2_sweep"] = method2_sweep
-            elif self._use_ridge:
-                gate_accy["oracle_select_top1"] = ridge_sweep.get("oracle")
-                gate_accy["ridge_sweep"] = ridge_sweep
-            else:
-                gate_accy["oracle_select_top1"] = selection_sweep.get("oracle")
-                gate_accy["selection_sweep"] = selection_sweep
-            gate_accy["eval_seconds"] = eval_seconds
-            gate_accy["ms_per_sample"] = 1000.0 * eval_seconds / max(num_samples, 1)
-            gate_accy["routing_flops"] = gate_flops
-        return cnn_accy, nme_accy, gate_accy
+        # Report timing + flops always; the perf sweep only when computed.
+        metrics = gate_accy if gate_accy is not None else {}
+        if perf_sweep is not None:
+            metrics["oracle_select_top1"] = perf_sweep.get("oracle")
+            metrics[sweep_key] = perf_sweep
+        metrics["eval_seconds"] = eval_seconds
+        metrics["ms_per_sample"] = 1000.0 * eval_seconds / max(num_samples, 1)
+        metrics["routing_flops"] = gate_flops
+        return cnn_accy, nme_accy, metrics
 
     def _true_task_from_targets(self, targets):
         true_task = torch.zeros_like(targets)
