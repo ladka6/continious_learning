@@ -1,4 +1,6 @@
 import logging
+import os
+import re
 import numpy as np
 import torch
 import time
@@ -62,6 +64,14 @@ class Learner(BaseLearner):
         return int(self._network.feature_dim)
 
     def incremental_train(self, data_manager):
+        self._setup_task_loaders(data_manager)
+        self._train()
+
+    def _setup_task_loaders(self, data_manager):
+        """Bookkeeping + dataloaders for the current task, split out from
+        incremental_train so an offline script can replay task boundaries
+        (task_ranges, fc sizing, test_loader) without running gradient
+        training -- it loads saved adapters/ridge state instead."""
         self._cur_task += 1
         self._total_classes = self._known_classes + data_manager.get_task_size(
             self._cur_task
@@ -105,8 +115,6 @@ class Learner(BaseLearner):
             shuffle=True,
             num_workers=num_workers,
         )
-
-        self._train()
 
     def _train(self):
         task_train_start = time.perf_counter()
@@ -158,6 +166,8 @@ class Learner(BaseLearner):
         logging.info(info)
         backbone_train_seconds = time.perf_counter() - backbone_train_start
         self._save_tosca()
+        if self._cur_task == 0:
+            self._save_adaptmlp()
 
         feature_collection_seconds = 0.0
         gate_train_seconds = 0.0
@@ -171,6 +181,7 @@ class Learner(BaseLearner):
 
         replace_fc_start = time.perf_counter()
         self.replace_fc()
+        self._save_ridge_state()
         replace_fc_seconds = time.perf_counter() - replace_fc_start
         task_train_seconds = time.perf_counter() - task_train_start
 
@@ -383,7 +394,7 @@ class Learner(BaseLearner):
         if self._gate is None:
             return
 
-        path = f"tosca/gate_task{self._cur_task}.pth"
+        path = os.path.join(self._ckpt_dir(), f"gate_task{self._cur_task}.pth")
         torch.save(
             {
                 "state_dict": self._gate.state_dict(),
@@ -652,24 +663,19 @@ class Learner(BaseLearner):
             vit_features, topk_tasks, lam, oracle_tasks
         )
 
-    def _get_global_routed_ridge_logits(
-        self, inputs, oracle_tasks=None, lam=None, k_route=None
-    ):
+    def _get_global_routed_ridge_logits(self, inputs, oracle_tasks=None, lam=None):
         """Method 2: the GLOBAL ridge routes (its cross-task discrimination is
         far stronger than the gate's), then the per-task TOSCA expert ridge
-        classifies within the chosen task(s). Replaces the weak gate with the
-        global ridge's own task ranking."""
+        classifies within the chosen task. Top-1 routing -- validated best
+        over k=1/2/5 (larger k only injects impostor experts)."""
         if lam is None:
             lam = float(self.args.get("ridge_lambda", 1e4))
-        if k_route is None:
-            k_route = int(self.args.get("ridge_route_topk", 1))
         vit_features = self._extract_backbone_features(inputs)
         global_logits = self._ridge_features(vit_features) @ self._global_ridge_weight(lam)
         task_scores = self._task_scores_from_logits(global_logits)
-        eff_k = max(1, min(k_route, self._cur_task + 1))
-        topk_tasks = torch.topk(task_scores, eff_k, dim=1).indices  # [B, eff_k]
+        top1_task = task_scores.argmax(dim=1, keepdim=True)  # [B, 1]
         return self._routed_ridge_from_tasks(
-            vit_features, topk_tasks, lam, oracle_tasks
+            vit_features, top1_task, lam, oracle_tasks
         )
 
     def _accumulate_global_ridge(self, frozen, labels):
@@ -757,45 +763,6 @@ class Learner(BaseLearner):
                     correct[lam] += (out.argmax(1) == targets).sum().item()
                 true_task = self._true_task_from_targets(targets)
                 out = ridge_logits(inputs, oracle_tasks=true_task, lam=oracle_lam)
-                correct["oracle"] += (out.argmax(1) == targets).sum().item()
-                total += targets.size(0)
-        return {k: 100.0 * c / max(total, 1) for k, c in correct.items()}
-
-    def _eval_method2_sweep(self, loader):
-        """Compare, in one pass: pure global (no routing), the global ridge as
-        router (@ several route-k), and oracle = route to the TRUE task then
-        expert ridge = within-expert ceiling. Tells us directly whether the
-        TOSCA experts add anything over pure global."""
-        lam = float(self.args.get("ridge_lambda", 1e4))
-        k_sweep = [int(k) for k in self.args.get("ridge_route_topk_sweep", [1, 2, 5])]
-        keys = (
-            ["pure_global"]
-            + ["global_route@{}".format(k) for k in k_sweep]
-            + ["oracle"]
-        )
-        correct = {k: 0 for k in keys}
-        total = 0
-        with torch.no_grad():
-            for _, inputs, targets in loader:
-                inputs = inputs.to(self._device)
-                targets = targets.long().to(self._device)
-                vit = self._extract_backbone_features(inputs)
-                gl = self._ridge_features(vit) @ self._global_ridge_weight(lam)
-                correct["pure_global"] += (gl.argmax(1) == targets).sum().item()
-
-                task_scores = self._task_scores_from_logits(gl)
-                for k in k_sweep:
-                    ek = max(1, min(k, self._cur_task + 1))
-                    tk = torch.topk(task_scores, ek, dim=1).indices
-                    out = self._routed_ridge_from_tasks(vit, tk, lam)
-                    correct["global_route@{}".format(k)] += (
-                        (out.argmax(1) == targets).sum().item()
-                    )
-
-                true_task = self._true_task_from_targets(targets)
-                out = self._routed_ridge_from_tasks(
-                    vit, true_task.unsqueeze(1), lam
-                )
                 correct["oracle"] += (out.argmax(1) == targets).sum().item()
                 total += targets.size(0)
         return {k: 100.0 * c / max(total, 1) for k, c in correct.items()}
@@ -985,8 +952,8 @@ class Learner(BaseLearner):
         eval_seconds = time.perf_counter() - eval_start
         # Sweep the classifier's key knob + oracle in one pass (eval-only, no
         # retrain). oracle is the recall@k x within-expert ceiling; gap to it is
-        # pure selection error. global_router reports only the current config's
-        # number (the CNN curve = global_route@ridge_route_topk), no sweep.
+        # pure selection error. global_router routes top-1 only (validated
+        # best), so it just reports the CNN curve -- no sweep.
         if self._use_ridge and self._ridge_scope == "global_router":
             perf_sweep, sweep_key = None, None
         elif self._use_ridge:
@@ -1047,8 +1014,79 @@ class Learner(BaseLearner):
 
         return np.concatenate(y_pred), np.concatenate(y_true)
 
+    def _ckpt_dir(self):
+        """Namespace all persisted checkpoints (tosca/adaptmlp/ridge/gate) by
+        dataset + prefix so concurrent or sequential runs -- different
+        datasets, or Tier-2 hyperparameter grid variants of the SAME dataset
+        -- never read/write each other's files. Previously every run shared
+        one flat tosca/ directory with no per-run tag, so any two runs
+        active at once (e.g. cub/omni/vtab all sharing prefix=' ') silently
+        clobbered each other's checkpoints."""
+        dataset = str(self.args.get("dataset", "data"))
+        prefix = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(self.args.get("prefix", "")).strip())
+        tag = f"{dataset}__{prefix}" if prefix else dataset
+        path = os.path.join("tosca", tag)
+        os.makedirs(path, exist_ok=True)
+        return path
+
+    def _save_adaptmlp(self):
+        """ViT AdaptMLP adapters are only trained on task 0 (_set_trainable),
+        then frozen forever -- but _save_tosca's 'tosca' name filter doesn't
+        catch them, so without this they'd never be persisted and an offline
+        script couldn't rebuild the exact frozen feature space training used."""
+        state = {
+            name: param
+            for name, param in self._network.state_dict().items()
+            if "adaptmlp" in name
+        }
+        path = os.path.join(self._ckpt_dir(), "adaptmlp.pth")
+        torch.save(state, path)
+        logging.info("AdaptMLP parameters saved to %s.", path)
+
+    def _load_adaptmlp(self):
+        path = os.path.join(self._ckpt_dir(), "adaptmlp.pth")
+        state = torch.load(path, map_location=self._device)
+        current_state_dict = self._network.state_dict()
+        current_state_dict.update(state)
+        self._network.load_state_dict(current_state_dict)
+
+    def _save_ridge_state(self):
+        """Persist the closed-form ridge matrices (G, C) so lambda/route-topk
+        can be swept offline later -- re-solving W=(G+lam*I)^-1 C from these
+        needs no retraining, no gradient step, not even the training images."""
+        if not self._use_ridge:
+            return
+        t = self._cur_task
+        ckpt_dir = self._ckpt_dir()
+        if self._ridge_scope in ("per_task", "global_router") and t in self._ridge_G:
+            torch.save(
+                {"G": self._ridge_G[t].cpu(), "C": self._ridge_C[t].cpu()},
+                os.path.join(ckpt_dir, f"ridge_task{t}.pth"),
+            )
+        if self._ridge_scope in ("global", "global_router") and self._ridge_G_global is not None:
+            torch.save(
+                {
+                    "G": self._ridge_G_global.cpu(),
+                    "C": self._ridge_C_global.cpu(),
+                },
+                os.path.join(ckpt_dir, f"ridge_global_task{t}.pth"),
+            )
+        logging.info("Ridge state saved for task %s.", t)
+
+    def _load_ridge_task(self, task_idx):
+        path = os.path.join(self._ckpt_dir(), f"ridge_task{task_idx}.pth")
+        state = torch.load(path, map_location=self._device)
+        self._ridge_G[task_idx] = state["G"].to(self._device)
+        self._ridge_C[task_idx] = state["C"].to(self._device)
+
+    def _load_ridge_global(self, task_idx):
+        path = os.path.join(self._ckpt_dir(), f"ridge_global_task{task_idx}.pth")
+        state = torch.load(path, map_location=self._device)
+        self._ridge_G_global = state["G"].to(self._device)
+        self._ridge_C_global = state["C"].to(self._device)
+
     def _save_tosca(self):
-        path = f"tosca/task{self._cur_task}.pth"
+        path = os.path.join(self._ckpt_dir(), f"task{self._cur_task}.pth")
         tosca_state_dict = {
             name: param
             for name, param in self._network.state_dict().items()
@@ -1058,13 +1096,13 @@ class Learner(BaseLearner):
         logging.info(f"tosca parameters saved to {path}.")
 
     def _load_tosca(self, idx):
-        # tosca/task{idx}.pth is written once and never modified, so the loaded
+        # task{idx}.pth is written once and never modified, so the loaded
         # state can be cached to avoid repeated disk reads (hot in per-epoch
         # head resampling and per-batch eval routing).
         tosca_state_dict = self._tosca_state_cache.get(idx)
         if tosca_state_dict is None:
             tosca_state_dict = torch.load(
-                f"tosca/task{idx}.pth", map_location=self._device
+                os.path.join(self._ckpt_dir(), f"task{idx}.pth"), map_location=self._device
             )
             self._tosca_state_cache[idx] = tosca_state_dict
         current_state_dict = self._network.state_dict()

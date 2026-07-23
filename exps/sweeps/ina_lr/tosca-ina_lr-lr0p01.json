@@ -1,10 +1,10 @@
 {
-  "prefix": " ",
-  "dataset": "cifar224",
+  "prefix": "tosca-ina_lr-lr0p01",
+  "dataset": "imageneta",
   "shuffle": true,
   "memory_size": 0,
-  "init_cls": 5,
-  "increment": 5,
+  "init_cls": 20,
+  "increment": 20,
   "model_name": "tosca",
   "backbone_type": "pretrained_vit_b16_224_in21k_adapter",
   "pretrained": true,
@@ -23,7 +23,7 @@
   "batch_size": 48,
   "optimizer": "sgd",
   "scheduler": "cosine",
-  "lr": 0.025,
+  "lr": 0.01,
   "weight_decay": 0,
   "milestones": [
     10,
@@ -31,7 +31,7 @@
   ],
   "use_ridge": true,
   "ridge_proj_dim": 5000,
-  "ridge_lambda": 10000.0,
+  "ridge_lambda": 1000.0,
   "ridge_normalize": true,
   "ridge_activation": "relu",
   "ridge_scope": "global_router"
