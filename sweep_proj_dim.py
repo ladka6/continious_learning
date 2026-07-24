@@ -32,6 +32,7 @@ def run_one(base_args, data_manager, target_task, proj_dim, lam):
     args = dict(base_args)
     args["ridge_proj_dim"] = proj_dim
     model = factory.get_model(args["model_name"], args)
+    model._network.to(model._device)
     if lam is not None:
         model.args["ridge_lambda"] = lam
 
