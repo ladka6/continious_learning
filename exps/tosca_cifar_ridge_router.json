@@ -23,15 +23,15 @@
   "batch_size": 48,
   "optimizer": "sgd",
   "scheduler": "cosine",
-  "lr": 0.025,
+  "lr": 0.05,
   "weight_decay": 0,
   "milestones": [
     10,
     15
   ],
   "use_ridge": true,
-  "ridge_proj_dim": 5000,
-  "ridge_lambda": 10000.0,
+  "ridge_proj_dim": 15000,
+  "ridge_lambda": 1000.0,
   "ridge_normalize": true,
   "ridge_activation": "relu",
   "ridge_scope": "global_router"
