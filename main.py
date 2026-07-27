@@ -17,7 +17,7 @@ def load_json(setting_path):
 
 def setup_parser():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--config', type=str, default='./exps/tosca.json',
+    parser.add_argument('--config', type=str, default='./exps/tosca_ina_ridge_router.json',
                         help='Json file of settings.')
     return parser
 

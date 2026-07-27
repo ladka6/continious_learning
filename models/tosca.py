@@ -9,11 +9,6 @@ from torch import optim
 from torch.nn import functional as F
 from torch.utils.data import DataLoader, TensorDataset
 
-from utils.gating import (
-    TaskGate,
-    FeatureStatsCollector,
-    generate_samples,
-)
 from utils.inc_net import SimpleVitNet
 from models.base import BaseLearner
 from utils.toolkit import tensor2numpy
@@ -29,28 +24,24 @@ class Learner(BaseLearner):
 
         # Task boundaries: task_ranges[i] = (start_class, end_class)
         self._task_ranges = []
-
-        # Gate components
-        self._gate = None
-        # task_id -> {class_id: {"mean", "covariance", "count"}} on L2-normalized
-        # features (used to train/route the gate).
-        self._task_feature_stats = {}
         self._latest_task_timing = {}
-        # How many experts the gate routes per sample. With top_k >= num_tasks
-        # this reduces to the TOSCA paper's original run-every-expert inference.
-        self._top_k = int(self.args.get("gate_top_k", self.args.get("moe_top_k", 2)))
 
         # idx -> saved tosca state dict (files are immutable once written).
         self._tosca_state_cache = {}
 
-        # Ridge classifier over the routed pool (RanPAC-style decorrelation).
-        # Shared random projection P + per-task Gram/class-sum so lambda stays
-        # re-solvable at eval time (free lambda sweep, no retraining).
-        self._use_ridge = bool(self.args.get("use_ridge", False))
-        # "per_task": one ridge head per task over the gate's routed pool.
-        # "global": a single RanPAC-style ridge over ALL classes on the shared
-        # frozen features -- decorrelates across tasks, no gate/experts at eval.
-        self._ridge_scope = str(self.args.get("ridge_scope", "per_task"))
+        # Ridge classifiers (RanPAC-style decorrelation). Shared random
+        # projection P + Gram/class-sum accumulators so lambda stays
+        # re-solvable at eval time (offline lambda sweep, no retraining).
+        # Inference (ridge_scope "global_router"): the global ridge on the
+        # frozen features routes top-1 to a task, then that task's
+        # TOSCA-expert ridge head classifies within the task.
+        self._ridge_scope = str(self.args.get("ridge_scope", "global_router"))
+        if not self.args.get("use_ridge", False) or self._ridge_scope != "global_router":
+            raise ValueError(
+                "Config must set use_ridge=true with ridge_scope 'global_router' "
+                f"(got use_ridge={self.args.get('use_ridge')}, "
+                f"ridge_scope={self._ridge_scope!r})."
+            )
         self._ridge_P = None  # [feat_dim, M] fixed random projection
         self._ridge_G = {}  # task_idx -> [M, M]  (Phi^T Phi)
         self._ridge_C = {}  # task_idx -> [M, inc] (Phi^T Y_onehot)
@@ -58,10 +49,6 @@ class Learner(BaseLearner):
         # Global-scope running accumulators (shared frozen-feature space).
         self._ridge_G_global = None  # [M, M]
         self._ridge_C_global = None  # [M, total_classes]
-
-    @property
-    def _gate_feature_dim(self):
-        return int(self._network.feature_dim)
 
     def incremental_train(self, data_manager):
         self._setup_task_loaders(data_manager)
@@ -169,16 +156,6 @@ class Learner(BaseLearner):
         if self._cur_task == 0:
             self._save_adaptmlp()
 
-        feature_collection_seconds = 0.0
-        gate_train_seconds = 0.0
-        if self._gate_enabled():
-            feature_collection_start = time.perf_counter()
-            self._collect_current_task_gate_stats()
-            feature_collection_seconds = time.perf_counter() - feature_collection_start
-            gate_train_start = time.perf_counter()
-            self._train_gate()
-            gate_train_seconds = time.perf_counter() - gate_train_start
-
         replace_fc_start = time.perf_counter()
         self.replace_fc()
         self._save_ridge_state()
@@ -187,17 +164,13 @@ class Learner(BaseLearner):
 
         self._latest_task_timing = {
             "backbone_train_seconds": backbone_train_seconds,
-            "feature_collection_seconds": feature_collection_seconds,
-            "gate_train_seconds": gate_train_seconds,
             "replace_fc_seconds": replace_fc_seconds,
             "task_train_seconds": task_train_seconds,
         }
         logging.info(
-            "Task {} timing => backbone_train {:.2f}s, feature_collection {:.2f}s, gate_train {:.2f}s, replace_fc {:.2f}s, total_train {:.2f}s".format(
+            "Task {} timing => backbone_train {:.2f}s, replace_fc {:.2f}s, total_train {:.2f}s".format(
                 self._cur_task,
                 backbone_train_seconds,
-                feature_collection_seconds,
-                gate_train_seconds,
                 replace_fc_seconds,
                 task_train_seconds,
             )
@@ -207,11 +180,6 @@ class Learner(BaseLearner):
         if isinstance(self._network, torch.nn.DataParallel):
             return self._network.module.backbone
         return self._network.backbone
-
-    def _gate_enabled(self):
-        # In global_router the global ridge is the router, so the synthetic
-        # TaskGate is not trained, evaluated, or logged at all.
-        return not (self._use_ridge and self._ridge_scope == "global_router")
 
     def _set_trainable(self):
         # Adapters trainable on task 0 only, frozen afterwards.
@@ -232,318 +200,9 @@ class Learner(BaseLearner):
         backbone = self._get_backbone()
         return backbone.forward_features(inputs)
 
-    def _prepare_gate_features(self, features):
-        if self.args.get("gate_normalize_features", True):
-            features = F.normalize(features, p=2, dim=1)
-        return features
-
-    def _synthetic_per_class(self):
-        return int(self.args.get("synthetic_per_class", 200))
-
-    def _gate_min_variance(self):
-        return float(self.args.get("gate_min_variance", 1e-6))
-
     def _classes_per_task(self):
         start, end = self._task_ranges[0]
         return end - start
-
-    def _collect_current_task_gate_stats(self):
-        """Store per-class mean + full covariance of real ViT features for the
-        current task. The gate is later trained on synthetic samples drawn from
-        these Gaussians; tosca heads keep training on real features."""
-        self._network.eval()
-        collector = FeatureStatsCollector(
-            feature_dim=self._gate_feature_dim,
-            min_variance=self._gate_min_variance(),
-            stats_mode="covariance",
-        )
-        with torch.no_grad():
-            for _, data, label in self.train_loader_for_protonet:
-                data = data.to(self._device)
-                label = label.long()
-                features = self._extract_backbone_features(data)
-                norm_features = self._prepare_gate_features(features)
-                collector.update(norm_features, label)
-
-        class_stats = collector.compute_mean_variance()
-        self._task_feature_stats[self._cur_task] = class_stats
-        logging.info(
-            "Stored full-covariance gate stats for task %s (%s classes).",
-            self._cur_task,
-            len(class_stats),
-        )
-
-    def _collect_all_gate_features(self):
-        """Generate synthetic ViT features from every task's stored per-class
-        Gaussians, labeled by task id, for gate training."""
-        n_samples = self._synthetic_per_class()
-        min_variance = self._gate_min_variance()
-
-        all_features = []
-        all_targets = []
-        for task_idx in range(self._cur_task + 1):
-            class_stats = self._task_feature_stats.get(task_idx)
-            if not class_stats:
-                continue
-            sampled_features, _ = generate_samples(
-                class_stats,
-                n_samples=n_samples,
-                min_variance=min_variance,
-                device="cpu",
-            )
-            if sampled_features.numel() == 0:
-                continue
-            task_targets = torch.full(
-                (sampled_features.size(0),), task_idx, dtype=torch.long
-            )
-            all_features.append(sampled_features)
-            all_targets.append(task_targets)
-
-        if len(all_features) == 0:
-            return (
-                torch.empty(0, self._gate_feature_dim),
-                torch.empty(0, dtype=torch.long),
-            )
-
-        return torch.cat(all_features, dim=0), torch.cat(all_targets, dim=0)
-
-    def _init_or_extend_gate(self):
-        num_tasks = self._cur_task + 1
-        if self._gate is None:
-            self._gate = TaskGate(
-                input_dim=self._gate_feature_dim,
-                num_tasks=num_tasks,
-                hidden_dim=int(self.args.get("gate_hidden_dim", 0)),
-                dropout=float(self.args.get("gate_dropout", 0.0)),
-            ).to(self._device)
-        else:
-            self._gate.extend(num_tasks)
-            self._gate.to(self._device)
-
-    def _train_gate(self):
-        self._init_or_extend_gate()
-
-        train_x, train_y = self._collect_all_gate_features()
-
-        if train_x.numel() == 0:
-            logging.warning("No synthetic features available for gate training.")
-            return
-
-        gate_batch_size = int(self.args.get("gate_batch_size", 256))
-        gate_epochs = int(self.args.get("gate_epochs", 10))
-        gate_lr = float(self.args.get("gate_lr", 1e-3))
-        gate_wd = float(self.args.get("gate_weight_decay", 0.0))
-
-        gate_dataset = TensorDataset(train_x, train_y)
-        gate_loader = DataLoader(
-            gate_dataset,
-            batch_size=gate_batch_size,
-            shuffle=True,
-            num_workers=0,
-        )
-
-        assert self._gate is not None
-        if self._gate.num_tasks < 2:
-            logging.info(
-                "Gate Task 0: single task, skipping training (nothing to discriminate)."
-            )
-            self._gate.eval()
-            self._save_gate()
-            return
-
-        optimizer = optim.Adam(
-            self._gate.parameters(), lr=gate_lr, weight_decay=gate_wd
-        )
-        criterion = torch.nn.CrossEntropyLoss()
-
-        self._gate.train()
-        for epoch in range(gate_epochs):
-            epoch_loss = 0.0
-            correct = 0
-            total = 0
-
-            for features, task_ids in gate_loader:
-                features = features.to(self._device)
-                task_ids = task_ids.to(self._device)
-
-                optimizer.zero_grad()
-                logits = self._gate(features)
-                loss = criterion(logits, task_ids)
-                loss.backward()
-                optimizer.step()
-
-                epoch_loss += loss.item()
-                preds = torch.argmax(logits, dim=1)
-                correct += (preds == task_ids).sum().item()
-                total += task_ids.size(0)
-
-            avg_loss = epoch_loss / max(len(gate_loader), 1)
-            train_acc = 100.0 * correct / total if total > 0 else 0.0
-            logging.info(
-                f"Gate Task {self._cur_task}, Epoch {epoch + 1}/{gate_epochs} => "
-                f"Loss {avg_loss:.4f}, Train_accy {train_acc:.2f}"
-            )
-            if avg_loss < 1e-4:
-                logging.info(f"Gate converged at epoch {epoch + 1}, stopping early.")
-                break
-
-        self._gate.eval()
-        self._save_gate()
-
-    def _save_gate(self):
-        if self._gate is None:
-            return
-
-        path = os.path.join(self._ckpt_dir(), f"gate_task{self._cur_task}.pth")
-        torch.save(
-            {
-                "state_dict": self._gate.state_dict(),
-                "num_tasks": self._cur_task + 1,
-                "input_dim": self._gate_feature_dim,
-                "hidden_dim": int(self.args.get("gate_hidden_dim", 0)),
-                "dropout": float(self.args.get("gate_dropout", 0.0)),
-            },
-            path,
-        )
-        logging.info(f"Gate parameters saved to {path}.")
-
-    def _routed_candidates(self, inputs):
-        """Expensive shared step of inference: one frozen-backbone forward, gate
-        top-k routing, and each routed expert's OWN-block cosine logits.
-
-        Only a candidate's own task classes are scored -- a prototype lives in
-        the feature space of the expert that built it (replace_fc runs per task),
-        so this-expert-feature vs other-task-prototype logits are meaningless and
-        were the main source of impostor confidence when k grew.
-
-        Returns:
-          own_logits    [B, eff_k, inc]  own-block cosine logits per candidate
-          gate_logprob  [B, eff_k]       gate log-prob of each candidate task
-          topk_tasks    [B, eff_k]       candidate task ids (gate-rank order)
-        """
-        if self._gate is None or self._gate.num_tasks < (self._cur_task + 1):
-            raise RuntimeError(
-                "Gate is not initialized or out of sync with current task count."
-            )
-
-        self._gate.eval()
-        vit_features = self._extract_backbone_features(inputs)
-        gate_logits = self._gate(self._prepare_gate_features(vit_features))
-
-        num_tasks = self._cur_task + 1
-        eff_k = max(1, min(self._top_k, num_tasks))
-        inc = self._classes_per_task()
-        batch_size = inputs.size(0)
-        device = inputs.device
-
-        topk_tasks = torch.topk(gate_logits, eff_k, dim=1).indices  # [B, eff_k]
-        starts = torch.tensor([s for s, _ in self._task_ranges], device=device)
-
-        own_logits = torch.zeros(batch_size, eff_k, inc, device=device)
-        for task_idx in torch.unique(topk_tasks).tolist():
-            task_idx = int(task_idx)
-            sel = topk_tasks == task_idx  # [B, eff_k]
-            rows = sel.any(dim=1)
-            self._load_tosca(task_idx)
-            task_features = self._get_backbone().forward_tosca(vit_features[rows])
-            logits = self._network.fc(task_features)["logits"]  # [rows, C]
-            start = int(starts[task_idx].item())
-            block = logits[:, start : start + inc]  # own classes only
-            block_full = torch.zeros(batch_size, inc, device=device)
-            block_full[rows] = block
-            for s in range(eff_k):
-                slot_mask = sel[:, s]
-                if slot_mask.any():
-                    own_logits[slot_mask, s, :] = block_full[slot_mask]
-
-        gate_logprob = torch.log_softmax(gate_logits, dim=1).gather(1, topk_tasks)
-        return own_logits, gate_logprob, topk_tasks
-
-    def _selection_score(self, own_logits, gate_logprob, rule):
-        """Per-candidate selection score [B, eff_k] under a given rule; the
-        highest-scoring candidate expert wins and its class is predicted."""
-        probs = torch.softmax(own_logits, dim=2)
-        entropy = -(probs * torch.log(probs.clamp_min(1e-12))).sum(dim=2)
-        if rule == "entropy":
-            return -entropy
-        if rule == "max_cosine":
-            # nearest-prototype (NCM/RanPAC) rule: pick the expert whose best
-            # own class has the highest cosine similarity. sigma is shared across
-            # experts so raw logits are directly comparable.
-            return own_logits.max(dim=2).values
-        if rule == "margin":
-            top2 = own_logits.topk(2, dim=2).values
-            return top2[..., 0] - top2[..., 1]
-        if rule == "entropy_gate":
-            gw = float(self.args.get("select_gate_weight", 1.0))
-            ew = float(self.args.get("select_entropy_weight", 1.0))
-            return gw * gate_logprob - ew * entropy
-        if rule == "max_cosine_gate":
-            gw = float(self.args.get("select_gate_weight", 1.0))
-            return own_logits.max(dim=2).values + gw * gate_logprob
-        raise ValueError(f"Unknown selection rule: {rule}")
-
-    def _scatter_winner(self, own_logits, topk_tasks, best_slot):
-        """Scatter the winning candidate's own-block scores to global class ids
-        (all other classes -inf), so argmax stays inside the chosen expert."""
-        batch_size, _, inc = own_logits.shape
-        device = own_logits.device
-        total_classes = self._network.fc.out_features
-        starts = torch.tensor([s for s, _ in self._task_ranges], device=device)
-        arange = torch.arange(batch_size, device=device)
-        win_task = topk_tasks[arange, best_slot]
-        win_logits = own_logits[arange, best_slot, :]
-        out_logits = torch.full(
-            (batch_size, total_classes), float("-inf"), device=device
-        )
-        offsets = torch.arange(inc, device=device)
-        idx = starts[win_task].unsqueeze(1) + offsets.unsqueeze(0)
-        out_logits.scatter_(1, idx, win_logits)
-        return out_logits
-
-    def _get_routed_prototype_logits(self, inputs, oracle_tasks=None):
-        """Full routed-prototype inference under the configured selection rule.
-
-        ``oracle_tasks`` ([B] true task ids), when given, forces the true task to
-        win selection whenever it is inside the routed top-k -- the recall@k x
-        within-expert ceiling (perfect selection among routed experts)."""
-        own_logits, gate_logprob, topk_tasks = self._routed_candidates(inputs)
-        rule = str(self.args.get("select_rule", "entropy_gate"))
-        score = self._selection_score(own_logits, gate_logprob, rule)
-        if oracle_tasks is not None:
-            oracle_tasks = oracle_tasks.to(score.device)
-            is_true = topk_tasks == oracle_tasks.unsqueeze(1)
-            score = torch.where(is_true, torch.full_like(score, float("inf")), score)
-        best_slot = score.argmax(dim=1)
-        return self._scatter_winner(own_logits, topk_tasks, best_slot)
-
-    def _eval_selection_sweep(self, loader):
-        """Evaluate every selection rule (plus the oracle) in ONE pass, reusing
-        a single expert forward per batch. Selection is eval-only, so this finds
-        the best operating point without retraining. Returns rule -> top1%."""
-        rules = ["entropy_gate", "entropy", "max_cosine", "max_cosine_gate", "margin"]
-        correct = {r: 0 for r in rules}
-        correct["oracle"] = 0
-        total = 0
-        with torch.no_grad():
-            for _, inputs, targets in loader:
-                inputs = inputs.to(self._device)
-                targets = targets.long().to(self._device)
-                true_task = self._true_task_from_targets(targets)
-                own_logits, gate_logprob, topk_tasks = self._routed_candidates(inputs)
-                for rule in rules:
-                    score = self._selection_score(own_logits, gate_logprob, rule)
-                    best_slot = score.argmax(dim=1)
-                    out = self._scatter_winner(own_logits, topk_tasks, best_slot)
-                    correct[rule] += (out.argmax(1) == targets).sum().item()
-                # oracle: force true task to win when routed
-                score = self._selection_score(own_logits, gate_logprob, "entropy_gate")
-                is_true = topk_tasks == true_task.unsqueeze(1)
-                score = torch.where(is_true, torch.full_like(score, float("inf")), score)
-                out = self._scatter_winner(own_logits, topk_tasks, score.argmax(dim=1))
-                correct["oracle"] += (out.argmax(1) == targets).sum().item()
-                total += targets.size(0)
-        return {r: 100.0 * c / max(total, 1) for r, c in correct.items()}
 
     # ------------------------------------------------------------------ ridge
     def _ridge_projection(self, feature_dim):
@@ -600,12 +259,14 @@ class Learner(BaseLearner):
             self._ridge_W_cache[key] = W
         return W
 
-    def _routed_ridge_from_tasks(self, vit_features, topk_tasks, lam, oracle_tasks=None):
+    def _routed_ridge_from_tasks(
+        self, vit_features, topk_tasks, lam, oracle_tasks=None
+    ):
         """Given shared ViT features and a per-sample set of candidate tasks
-        [B, k] (from ANY router -- the gate or the global ridge), score each
-        routed expert's classes with its per-task ridge head and scatter to the
-        global class union. Argmax over the union is a JOINT decision -- ridge
-        regresses to one-hot, so scores are cross-expert comparable."""
+        [B, k] (from the global-ridge router), score each routed expert's
+        classes with its per-task ridge head and scatter to the global class
+        union. Argmax over the union is a JOINT decision -- ridge regresses to
+        one-hot, so scores are cross-expert comparable."""
         inc = self._classes_per_task()
         device = vit_features.device
         batch_size = vit_features.size(0)
@@ -636,12 +297,6 @@ class Learner(BaseLearner):
             out_logits = torch.where(routed_true.unsqueeze(1), keep, out_logits)
         return out_logits
 
-    def _gate_topk_tasks(self, vit_features):
-        self._gate.eval()
-        gate_logits = self._gate(self._prepare_gate_features(vit_features))
-        eff_k = max(1, min(self._top_k, self._cur_task + 1))
-        return torch.topk(gate_logits, eff_k, dim=1).indices  # [B, eff_k]
-
     def _task_scores_from_logits(self, logits):
         """Class logits [B, C] -> per-task score [B, num_tasks] (max class in
         each task's block). Used to route from the global ridge's own output."""
@@ -653,36 +308,25 @@ class Learner(BaseLearner):
             scores[:, t] = logits[:, start:end].max(dim=1).values
         return scores
 
-    def _get_routed_ridge_logits(self, inputs, oracle_tasks=None, lam=None):
-        """Gate routes top-k -> per-task ridge classifies within the pool."""
-        if lam is None:
-            lam = float(self.args.get("ridge_lambda", 1e4))
-        vit_features = self._extract_backbone_features(inputs)
-        topk_tasks = self._gate_topk_tasks(vit_features)
-        return self._routed_ridge_from_tasks(
-            vit_features, topk_tasks, lam, oracle_tasks
-        )
-
     def _get_global_routed_ridge_logits(self, inputs, oracle_tasks=None, lam=None):
-        """Method 2: the GLOBAL ridge routes (its cross-task discrimination is
-        far stronger than the gate's), then the per-task TOSCA expert ridge
-        classifies within the chosen task. Top-1 routing -- validated best
-        over k=1/2/5 (larger k only injects impostor experts)."""
+        """global_router: the GLOBAL ridge routes, then the per-task TOSCA
+        expert ridge classifies within the chosen task. Top-1 routing --
+        validated best over k=1/2/5 (larger k only injects impostor experts)."""
         if lam is None:
             lam = float(self.args.get("ridge_lambda", 1e4))
         vit_features = self._extract_backbone_features(inputs)
-        global_logits = self._ridge_features(vit_features) @ self._global_ridge_weight(lam)
+        global_logits = self._ridge_features(vit_features) @ self._global_ridge_weight(
+            lam
+        )
         task_scores = self._task_scores_from_logits(global_logits)
         top1_task = task_scores.argmax(dim=1, keepdim=True)  # [B, 1]
-        return self._routed_ridge_from_tasks(
-            vit_features, top1_task, lam, oracle_tasks
-        )
+        return self._routed_ridge_from_tasks(vit_features, top1_task, lam, oracle_tasks)
 
     def _accumulate_global_ridge(self, frozen, labels):
         """RanPAC-style single classifier: accumulate one shared Gram
         G = Phi^T Phi and class-sum C = Phi^T Y over ALL classes, in the frozen
-        (pre-tosca) feature space. Decorrelates across tasks -- no gate, no
-        experts at inference. Grows C's columns as new classes arrive."""
+        (pre-tosca) feature space. Decorrelates across tasks. Grows C's
+        columns as new classes arrive."""
         total = self._total_classes
         frozen = frozen.to(self._device)
         labels = labels.to(self._device).long()
@@ -720,53 +364,6 @@ class Learner(BaseLearner):
             self._ridge_W_cache[key] = W
         return W
 
-    def _get_global_ridge_logits(self, inputs, oracle_tasks=None, lam=None):
-        """Single global ridge over all classes on frozen features. argmax over
-        every class -- task-id free (this is the RanPAC path). ``oracle_tasks``
-        restricts to the true task's block for the within-task reference."""
-        if lam is None:
-            lam = float(self.args.get("ridge_lambda", 1e4))
-        vit = self._extract_backbone_features(inputs)
-        logits = self._ridge_features(vit) @ self._global_ridge_weight(lam)
-        if oracle_tasks is not None:
-            inc = self._classes_per_task()
-            device = inputs.device
-            starts = torch.tensor([s for s, _ in self._task_ranges], device=device)
-            offsets = torch.arange(inc, device=device)
-            block = starts[oracle_tasks.to(device)].unsqueeze(1) + offsets.unsqueeze(0)
-            keep = torch.full_like(logits, float("-inf"))
-            keep.scatter_(1, block, logits.gather(1, block))
-            logits = keep
-        return logits
-
-    def _eval_ridge_sweep(self, loader):
-        """Re-solve ridge for several lambda in one pass (lambda is eval-only
-        once G_t/C_t are stored) and report joint-argmax top1 + oracle."""
-        lambdas = [float(x) for x in self.args.get(
-            "ridge_lambda_sweep", [1e1, 1e2, 1e3, 1e4, 1e5]
-        )]
-        correct = {lam: 0 for lam in lambdas}
-        oracle_lam = float(self.args.get("ridge_lambda", 1e4))
-        correct["oracle"] = 0
-        total = 0
-        ridge_logits = (
-            self._get_global_ridge_logits
-            if self._ridge_scope == "global"
-            else self._get_routed_ridge_logits
-        )
-        with torch.no_grad():
-            for _, inputs, targets in loader:
-                inputs = inputs.to(self._device)
-                targets = targets.long().to(self._device)
-                for lam in lambdas:
-                    out = ridge_logits(inputs, lam=lam)
-                    correct[lam] += (out.argmax(1) == targets).sum().item()
-                true_task = self._true_task_from_targets(targets)
-                out = ridge_logits(inputs, oracle_tasks=true_task, lam=oracle_lam)
-                correct["oracle"] += (out.argmax(1) == targets).sum().item()
-                total += targets.size(0)
-        return {k: 100.0 * c / max(total, 1) for k, c in correct.items()}
-
     def after_task(self):
         self._network.backbone.reset_tosca()
         self._known_classes = self._total_classes
@@ -774,7 +371,6 @@ class Learner(BaseLearner):
     def replace_fc(self):
         self._network.eval()
         self._load_tosca(self._cur_task)
-        need_frozen = self._use_ridge and self._ridge_scope in ("global", "global_router")
         embedding_list = []
         frozen_list = []
         label_list = []
@@ -782,14 +378,9 @@ class Learner(BaseLearner):
             for _, data, label in self.train_loader_for_protonet:
                 data = data.to(self._device)
                 label = label.long().to(self._device)
-                if need_frozen:
-                    vit = self._extract_backbone_features(data)
-                    frozen_list.append(vit.cpu())
-                    embedding_list.append(
-                        self._get_backbone().forward_tosca(vit).cpu()
-                    )
-                else:
-                    embedding_list.append(self._network.backbone(data).cpu())
+                vit = self._extract_backbone_features(data)
+                frozen_list.append(vit.cpu())
+                embedding_list.append(self._get_backbone().forward_tosca(vit).cpu())
                 label_list.append(label.cpu())
         embedding_list = torch.cat(embedding_list, dim=0)
         label_list = torch.cat(label_list, dim=0)
@@ -805,13 +396,8 @@ class Learner(BaseLearner):
         # exemplar-free (only Gram/class-sum stored, never raw samples).
         # global_router needs BOTH: the global head (routes) and the per-task
         # heads (classify within the routed task).
-        if self._use_ridge:
-            if self._ridge_scope in ("global", "global_router"):
-                self._accumulate_global_ridge(
-                    torch.cat(frozen_list, dim=0), label_list
-                )
-            if self._ridge_scope in ("per_task", "global_router"):
-                self._fit_ridge_head(embedding_list, label_list)
+        self._accumulate_global_ridge(torch.cat(frozen_list, dim=0), label_list)
+        self._fit_ridge_head(embedding_list, label_list)
 
     def get_optimizer(self, lr):
         if self.args["optimizer"] == "sgd":
@@ -857,84 +443,16 @@ class Learner(BaseLearner):
             )
         return scheduler
 
-    def _eval_gate_routing(self, loader):
-        if self._gate is None:
-            return None
-
-        self._gate.eval()
-        correct = 0
-        recall_k_correct = 0
-        total = 0
-        k = max(1, min(self._top_k, len(self._task_ranges)))
-        per_task = {
-            task_idx: {"correct": 0, "total": 0, "predicted": 0}
-            for task_idx in range(len(self._task_ranges))
-        }
-
-        with torch.no_grad():
-            for _, inputs, targets in loader:
-                inputs = inputs.to(self._device)
-                targets = targets.long()
-
-                features = self._extract_backbone_features(inputs)
-                features = self._prepare_gate_features(features)
-                gate_logits = self._gate(features)
-                chosen_task = torch.argmax(gate_logits, dim=1).cpu()
-                topk_tasks = torch.topk(gate_logits, k, dim=1).indices.cpu()  # [B, k]
-
-                true_task = torch.zeros_like(targets)
-                for t, (start, end) in enumerate(self._task_ranges):
-                    mask = (targets >= start) & (targets < end)
-                    true_task[mask] = t
-
-                correct += (chosen_task == true_task).sum().item()
-                recall_k_correct += (
-                    (topk_tasks == true_task.unsqueeze(1)).any(dim=1).sum().item()
-                )
-                total += targets.size(0)
-                for task_idx in range(len(self._task_ranges)):
-                    true_mask = true_task == task_idx
-                    pred_mask = chosen_task == task_idx
-                    per_task[task_idx]["total"] += true_mask.sum().item()
-                    per_task[task_idx]["correct"] += (
-                        (chosen_task[true_mask] == true_task[true_mask]).sum().item()
-                    )
-                    per_task[task_idx]["predicted"] += pred_mask.sum().item()
-
-        gate_acc = 100.0 * correct / total if total > 0 else 0.0
-        recall_at_k = 100.0 * recall_k_correct / total if total > 0 else 0.0
-        for task_idx, stats in per_task.items():
-            task_total = stats["total"]
-            stats["accuracy"] = (
-                100.0 * stats["correct"] / task_total if task_total > 0 else 0.0
-            )
-        return {
-            "top1": gate_acc,
-            "recall_at_k": recall_at_k,
-            "top_k": k,
-            "per_task": per_task,
-        }
-
-    def _compute_gate_routing_flops(self, batch_size=1):
+    def _compute_routing_flops(self, batch_size=1):
         num_tasks = max(self._cur_task + 1, 1)
 
-        if self._use_ridge and self._ridge_scope == "global_router":
-            # Router = global ridge: normalize + random projection (768->M) +
-            # ReLU + linear head to all seen classes. (Expert cost is separate.)
-            feat_dim = int(self._network.feature_dim)
-            M = int(self.args.get("ridge_proj_dim", 5000))
-            classes = int(self._total_classes)
-            per_sample_flops = feat_dim + 2 * feat_dim * M + M + 2 * M * classes
-        else:
-            input_dim = int(self._gate_feature_dim)
-            hidden_dim = int(self.args.get("gate_hidden_dim", 0))
-            if hidden_dim > 0:
-                hidden_flops = 2 * input_dim * hidden_dim + hidden_dim
-                classifier_flops = 2 * hidden_dim * num_tasks
-            else:
-                hidden_flops = 0
-                classifier_flops = 2 * input_dim * num_tasks
-            per_sample_flops = hidden_flops + classifier_flops
+        # Global ridge as router/classifier: normalize + random projection
+        # (768->M) + ReLU + linear head to all seen classes. (In global_router
+        # the per-task expert cost is separate.)
+        feat_dim = int(self._network.feature_dim)
+        M = int(self.args.get("ridge_proj_dim", 5000))
+        classes = int(self._total_classes)
+        per_sample_flops = feat_dim + 2 * feat_dim * M + M + 2 * M * classes
 
         return {
             "per_sample": int(per_sample_flops),
@@ -948,30 +466,15 @@ class Learner(BaseLearner):
         y_pred, y_true = self._eval_cnn(self.test_loader)
         cnn_accy = self._evaluate(y_pred, y_true)
         nme_accy = None
-        gate_accy = self._eval_gate_routing(self.test_loader)  # None when gate off
         eval_seconds = time.perf_counter() - eval_start
-        # Sweep the classifier's key knob + oracle in one pass (eval-only, no
-        # retrain). oracle is the recall@k x within-expert ceiling; gap to it is
-        # pure selection error. global_router routes top-1 only (validated
-        # best), so it just reports the CNN curve -- no sweep.
-        if self._use_ridge and self._ridge_scope == "global_router":
-            perf_sweep, sweep_key = None, None
-        elif self._use_ridge:
-            perf_sweep, sweep_key = self._eval_ridge_sweep(self.test_loader), "ridge_sweep"
-        else:
-            perf_sweep, sweep_key = self._eval_selection_sweep(self.test_loader), "selection_sweep"
         num_samples = len(self.test_loader.dataset)
-        gate_flops = self._compute_gate_routing_flops(
+        routing_flops = self._compute_routing_flops(
             batch_size=self.test_loader.batch_size
         )
-        # Report timing + flops always; the perf sweep only when computed.
-        metrics = gate_accy if gate_accy is not None else {}
-        if perf_sweep is not None:
-            metrics["oracle_select_top1"] = perf_sweep.get("oracle")
-            metrics[sweep_key] = perf_sweep
+        metrics = {}
         metrics["eval_seconds"] = eval_seconds
         metrics["ms_per_sample"] = 1000.0 * eval_seconds / max(num_samples, 1)
-        metrics["routing_flops"] = gate_flops
+        metrics["routing_flops"] = routing_flops
         return cnn_accy, nme_accy, metrics
 
     def _true_task_from_targets(self, targets):
@@ -987,25 +490,10 @@ class Learner(BaseLearner):
         for _, (_, inputs, targets) in enumerate(loader):
             inputs, targets = inputs.to(self._device), targets.long().to(self._device)
             with torch.no_grad():
-                oracle_tasks = (
-                    self._true_task_from_targets(targets) if oracle else None
+                oracle_tasks = self._true_task_from_targets(targets) if oracle else None
+                outputs = self._get_global_routed_ridge_logits(
+                    inputs, oracle_tasks=oracle_tasks
                 )
-                if self._use_ridge and self._ridge_scope == "global":
-                    outputs = self._get_global_ridge_logits(
-                        inputs, oracle_tasks=oracle_tasks
-                    )
-                elif self._use_ridge and self._ridge_scope == "global_router":
-                    outputs = self._get_global_routed_ridge_logits(
-                        inputs, oracle_tasks=oracle_tasks
-                    )
-                elif self._use_ridge:
-                    outputs = self._get_routed_ridge_logits(
-                        inputs, oracle_tasks=oracle_tasks
-                    )
-                else:
-                    outputs = self._get_routed_prototype_logits(
-                        inputs, oracle_tasks=oracle_tasks
-                    )
             predicts = torch.topk(
                 outputs, k=self.topk, dim=1, largest=True, sorted=True
             )[1]
@@ -1023,7 +511,9 @@ class Learner(BaseLearner):
         active at once (e.g. cub/omni/vtab all sharing prefix=' ') silently
         clobbered each other's checkpoints."""
         dataset = str(self.args.get("dataset", "data"))
-        prefix = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(self.args.get("prefix", "")).strip())
+        prefix = re.sub(
+            r"[^A-Za-z0-9_.-]+", "_", str(self.args.get("prefix", "")).strip()
+        )
         tag = f"{dataset}__{prefix}" if prefix else dataset
         path = os.path.join("tosca", tag)
         os.makedirs(path, exist_ok=True)
@@ -1054,16 +544,14 @@ class Learner(BaseLearner):
         """Persist the closed-form ridge matrices (G, C) so lambda/route-topk
         can be swept offline later -- re-solving W=(G+lam*I)^-1 C from these
         needs no retraining, no gradient step, not even the training images."""
-        if not self._use_ridge:
-            return
         t = self._cur_task
         ckpt_dir = self._ckpt_dir()
-        if self._ridge_scope in ("per_task", "global_router") and t in self._ridge_G:
+        if t in self._ridge_G:
             torch.save(
                 {"G": self._ridge_G[t].cpu(), "C": self._ridge_C[t].cpu()},
                 os.path.join(ckpt_dir, f"ridge_task{t}.pth"),
             )
-        if self._ridge_scope in ("global", "global_router") and self._ridge_G_global is not None:
+        if self._ridge_G_global is not None:
             torch.save(
                 {
                     "G": self._ridge_G_global.cpu(),
@@ -1102,7 +590,8 @@ class Learner(BaseLearner):
         tosca_state_dict = self._tosca_state_cache.get(idx)
         if tosca_state_dict is None:
             tosca_state_dict = torch.load(
-                os.path.join(self._ckpt_dir(), f"task{idx}.pth"), map_location=self._device
+                os.path.join(self._ckpt_dir(), f"task{idx}.pth"),
+                map_location=self._device,
             )
             self._tosca_state_cache[idx] = tosca_state_dict
         current_state_dict = self._network.state_dict()

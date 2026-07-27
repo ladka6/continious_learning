@@ -45,7 +45,7 @@ The **LuCA** module consists of two branches applied to the [CLS] token:
 
 In the full **TOSCA** flow, the adapter output is first normalized and residually added to the input, and then the calibrator gates the result — yielding a compact yet expressive adaptation of the [CLS] token representation.
 
-At **inference time**, TOSCA selects the most relevant task-specific module via **entropy minimization** over stored per-task checkpoints, with no task-identity labels required.
+At **inference time**, this repository routes each sample with a **RanPAC-style global ridge classifier** fit on the frozen ViT features (closed-form, exemplar-free), dispatching top-1 to the task-specific TOSCA expert's ridge head — no task-identity labels required.
 
 <p align="center">
   <img src="resources/results.png" width="75%" alt="TOSCA Results"/>
@@ -69,12 +69,12 @@ TOSCA supports the following benchmarks:
 
 | Dataset | Config file |
 |---|---|
-| CIFAR-100 | `exps/tosca_cifar.json` | 
-| CUB-200 | `exps/tosca_cub.json` |
-| ImageNet-A | `exps/tosca_ina.json` |
-| ImageNet-R | `exps/tosca_inr.json` |
-| OmniBenchmark | `exps/tosca_omni.json` |
-| VTAB | `exps/tosca_vtab.json` |
+| CIFAR-100 | `exps/tosca_cifar_ridge_router.json` |
+| CUB-200 | `exps/tosca_cub_ridge_router.json` |
+| ImageNet-A | `exps/tosca_ina_ridge_router.json` |
+| ImageNet-R | `exps/tosca_inr_ridge_router.json` |
+| OmniBenchmark | `exps/tosca_omni_ridge_router.json` |
+| VTAB | `exps/tosca_vtab_ridge_router.json` |
 
 For **CIFAR-100**, the dataset is downloaded automatically. For all other datasets, specify the data path in `utils/data.py`:
 
@@ -86,20 +86,25 @@ def download_data(self):
 
 ### 🔑 Running Experiments
 
+Inference uses ridge routing (`ridge_scope: "global_router"` in every config): a single RanPAC-style global ridge on the frozen ViT features routes each sample top-1 to a task, then that task's TOSCA-expert ridge head classifies within the task.
+
 1. Select and (optionally) edit the config file for your target dataset.
 2. Run training:
 
 ```bash
-python main.py --config=./exps/tosca_[DATASET].json
+python main.py --config=./exps/tosca_[DATASET]_ridge_router.json
 ```
 
-For gated task routing (stored ViT feature memory + gate), use:
+Logs are saved to `logs/<model>/<dataset>/<init_cls>/<increment>/` and per-task TOSCA checkpoints + ridge matrices to `tosca/<dataset>__<prefix>/`.
+
+Offline sweeps (no retraining) over saved runs:
 
 ```bash
-python main.py --config=./exps/tosca_cifar_gate.json
+python sweep_ridge.py --config exps/tosca_ina_ridge_router.json --lambdas 10,100,1000,10000,100000 --task -1
+python sweep_proj_dim.py --config exps/tosca_ina_ridge_router.json --proj-dims 2000,5000,10000
 ```
 
-Logs are saved to `logs/<model>/<dataset>/<init_cls>/<increment>/` and per-task TOSCA checkpoints to `tosca/task<i>.pth`.
+Full-retrain hyperparameter grids (SLURM) can be generated with `gen_grid_configs.py`.
 
 ### ⚙️ Hyperparameters
 

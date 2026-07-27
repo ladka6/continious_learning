@@ -65,7 +65,6 @@ def _train(args):
     model = factory.get_model(args["model_name"], args)
 
     cnn_curve, nme_curve = {"top1": [], "top5": []}, {"top1": [], "top5": []}
-    gate_curve = {"top1": []}
     cnn_matrix, nme_matrix = [], []
 
     for task in range(data_manager.nb_tasks):
@@ -85,7 +84,7 @@ def _train(args):
         eval_result = model.eval_task()
         eval_wall_seconds = time.perf_counter() - eval_wall_start
         cnn_accy, nme_accy = eval_result[0], eval_result[1]
-        gate_accy = eval_result[2] if len(eval_result) > 2 else None
+        eval_metrics = eval_result[2] if len(eval_result) > 2 else None
         model.after_task()
 
         if nme_accy is not None:
@@ -116,12 +115,8 @@ def _train(args):
 
             logging.info("Average Accuracy (CNN): {}".format(sum(cnn_curve["top1"])/len(cnn_curve["top1"])))
             logging.info("Average Accuracy (NME): {}".format(sum(nme_curve["top1"])/len(nme_curve["top1"])))
-            if gate_accy is not None:
-                if "top1" in gate_accy:
-                    gate_curve["top1"].append(gate_accy["top1"])
-                    logging.info("Gate top1 curve: {}".format(gate_curve["top1"]))
-                    logging.info("Average Accuracy (Gate): {}".format(sum(gate_curve["top1"]) / len(gate_curve["top1"])))
-                _log_gate_metrics(task, gate_accy, eval_wall_seconds)
+            if eval_metrics is not None:
+                _log_eval_metrics(task, eval_metrics, eval_wall_seconds)
         else:
             logging.info("No NME accuracy.")
             logging.info("CNN: {}".format(cnn_accy["grouped"]))
@@ -138,12 +133,8 @@ def _train(args):
 
             print('Average Accuracy (CNN):', sum(cnn_curve["top1"])/len(cnn_curve["top1"]))
             logging.info("Average Accuracy (CNN): {} \n".format(sum(cnn_curve["top1"])/len(cnn_curve["top1"])))
-            if gate_accy is not None:
-                if "top1" in gate_accy:
-                    gate_curve["top1"].append(gate_accy["top1"])
-                    logging.info("Gate top1 curve: {}".format(gate_curve["top1"]))
-                    logging.info("Average Accuracy (Gate): {}".format(sum(gate_curve["top1"]) / len(gate_curve["top1"])))
-                _log_gate_metrics(task, gate_accy, eval_wall_seconds)
+            if eval_metrics is not None:
+                _log_eval_metrics(task, eval_metrics, eval_wall_seconds)
 
     if 'print_forget' in args.keys() and args['print_forget'] is True:
         if len(cnn_matrix) > 0:
@@ -196,51 +187,18 @@ def print_args(args):
         logging.info("{}: {}".format(key, value))
 
 
-def _log_gate_metrics(task, gate_accy, eval_wall_seconds):
+def _log_eval_metrics(task, eval_metrics, eval_wall_seconds):
     logging.info("Task {} eval time: {:.2f}s".format(task, eval_wall_seconds))
 
-    if "recall_at_k" in gate_accy:
-        logging.info(
-            "Gate routing top1: {:.2f}%, recall@{}: {:.2f}% (routed accuracy ceiling)".format(
-                gate_accy.get("top1", 0.0),
-                gate_accy.get("top_k", 1),
-                gate_accy["recall_at_k"],
-            )
-        )
-
-    sweep = gate_accy.get("selection_sweep")
-    if sweep:
-        oracle = sweep.get("oracle", 0.0)
-        rules = [(r, v) for r, v in sweep.items() if r != "oracle"]
-        rules.sort(key=lambda kv: kv[1], reverse=True)
-        summary = ", ".join("{}={:.2f}".format(r, v) for r, v in rules)
-        logging.info(
-            "Selection sweep (top-{}) => {} | oracle={:.2f} (ceiling)".format(
-                gate_accy.get("top_k", 1), summary, oracle
-            )
-        )
-
-    ridge_sweep = gate_accy.get("ridge_sweep")
-    if ridge_sweep:
-        oracle = ridge_sweep.get("oracle", 0.0)
-        lams = [(k, v) for k, v in ridge_sweep.items() if k != "oracle"]
-        lams.sort(key=lambda kv: kv[1], reverse=True)
-        summary = ", ".join("lam={:g}:{:.2f}".format(k, v) for k, v in lams)
-        logging.info(
-            "Ridge sweep (top-{}, joint) => {} | oracle={:.2f} (ceiling)".format(
-                gate_accy.get("top_k", 1), summary, oracle
-            )
-        )
-
-    if "eval_seconds" in gate_accy:
+    if "eval_seconds" in eval_metrics:
         logging.info(
             "Eval time: {:.2f}s ({:.3f} ms/sample)".format(
-                gate_accy["eval_seconds"],
-                gate_accy.get("ms_per_sample", 0.0),
+                eval_metrics["eval_seconds"],
+                eval_metrics.get("ms_per_sample", 0.0),
             )
         )
 
-    routing_flops = gate_accy.get("routing_flops")
+    routing_flops = eval_metrics.get("routing_flops")
     if routing_flops is not None:
         logging.info(
             "Routing FLOPs => per_sample: {}, per_batch@{}: {}, num_tasks: {}".format(
@@ -250,17 +208,3 @@ def _log_gate_metrics(task, gate_accy, eval_wall_seconds):
                 routing_flops["num_tasks"],
             )
         )
-
-    per_task = gate_accy.get("per_task")
-    if per_task:
-        logging.info("Gate routing task-by-task after Task {}".format(task))
-        for task_idx, stats in per_task.items():
-            logging.info(
-                "  True Task {} => correct {}/{} ({:.2f}%), predicted_as_task {} times".format(
-                    task_idx,
-                    stats["correct"],
-                    stats["total"],
-                    stats["accuracy"],
-                    stats["predicted"],
-                )
-            )
