@@ -224,9 +224,8 @@ class iImageNetR(iData):
         self.class_order = np.arange(200).tolist()
 
     def download_data(self):
-        assert 0, "You should specify the folder of your dataset"
-        train_dir = "[DATA-PATH]/train/"
-        test_dir = "[DATA-PATH]/test/"
+        train_dir = "data/imagenet-r-split/train/"
+        test_dir = "data/imagenet-r-split/test/"
 
         train_dset = datasets.ImageFolder(train_dir)
         test_dset = datasets.ImageFolder(test_dir)
@@ -259,7 +258,7 @@ class iImageNetA(iData):
 
 class CUB(iData):
     use_path = True
-    
+
     train_trsf = build_transform(True, None)
     test_trsf = build_transform(False, None)
     common_trsf = [    ]
@@ -267,9 +266,8 @@ class CUB(iData):
     class_order = np.arange(200).tolist()
 
     def download_data(self):
-        assert 0, "You should specify the folder of your dataset"
-        train_dir = "[DATA-PATH]/train/"
-        test_dir = "[DATA-PATH]/test/"
+        train_dir = "data/cub/train/"
+        test_dir = "data/cub/test/"
 
         train_dset = datasets.ImageFolder(train_dir)
         test_dset = datasets.ImageFolder(test_dir)
@@ -301,7 +299,7 @@ class objectnet(iData):
 
 class omnibenchmark(iData):
     use_path = True
-    
+
     train_trsf = build_transform(True, None)
     test_trsf = build_transform(False, None)
     common_trsf = [    ]
@@ -309,9 +307,8 @@ class omnibenchmark(iData):
     class_order = np.arange(300).tolist()
 
     def download_data(self):
-        assert 0, "You should specify the folder of your dataset"
-        train_dir = "[DATA-PATH]/train/"
-        test_dir = "[DATA-PATH]/test/"
+        train_dir = "data/omnibenchmark/train/"
+        test_dir = "data/omnibenchmark/test/"
 
         train_dset = datasets.ImageFolder(train_dir)
         test_dset = datasets.ImageFolder(test_dir)
@@ -323,7 +320,7 @@ class omnibenchmark(iData):
 
 class vtab(iData):
     use_path = True
-    
+
     train_trsf = build_transform(True, None)
     test_trsf = build_transform(False, None)
     common_trsf = [    ]
@@ -331,9 +328,8 @@ class vtab(iData):
     class_order = np.arange(50).tolist()
 
     def download_data(self):
-        assert 0, "You should specify the folder of your dataset"
-        train_dir = "[DATA-PATH]/train/"
-        test_dir = "[DATA-PATH]/test/"
+        train_dir = "data/vtab/train/"
+        test_dir = "data/vtab/test/"
 
         train_dset = datasets.ImageFolder(train_dir)
         test_dset = datasets.ImageFolder(test_dir)

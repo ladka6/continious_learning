@@ -2,6 +2,7 @@ import sys
 import logging
 import copy
 import torch
+import time
 from utils import factory
 from utils.data_manager import DataManager
 from utils.toolkit import count_parameters
@@ -64,7 +65,6 @@ def _train(args):
     model = factory.get_model(args["model_name"], args)
 
     cnn_curve, nme_curve = {"top1": [], "top5": []}, {"top1": [], "top5": []}
-    gate_curve = {"top1": []}
     cnn_matrix, nme_matrix = [], []
 
     for task in range(data_manager.nb_tasks):
@@ -72,38 +72,23 @@ def _train(args):
         logging.info(
             "Trainable params: {}".format(count_parameters(model._network, True))
         )
+        task_wall_start = time.perf_counter()
         model.incremental_train(data_manager)
-        eval_result = model.eval_task()
-        cnn_accy, nme_accy = eval_result[0], eval_result[1]
-        gate_accy = eval_result[2] if len(eval_result) > 2 else None
-        routing_comparison = (
-            model.eval_routing_comparison()
-            if hasattr(model, "eval_routing_comparison")
-            else None
+        task_train_only_seconds = time.perf_counter() - task_wall_start
+        logging.info(
+            "Task {} wall-clock training time: {:.2f}s".format(
+                task, task_train_only_seconds
+            )
         )
+        eval_wall_start = time.perf_counter()
+        eval_result = model.eval_task()
+        eval_wall_seconds = time.perf_counter() - eval_wall_start
+        cnn_accy, nme_accy = eval_result[0], eval_result[1]
+        eval_metrics = eval_result[2] if len(eval_result) > 2 else None
         model.after_task()
 
         if nme_accy is not None:
             logging.info("CNN: {}".format(cnn_accy["grouped"]))
-            if routing_comparison is not None:
-                logging.info(
-                    "CNN (ENTROPY ROUTING): {}".format(
-                        routing_comparison["entropy"]["grouped"]
-                    )
-                )
-                logging.info(
-                    "CNN (GATE ROUTING): {}".format(
-                        routing_comparison["gate"]["grouped"]
-                    )
-                )
-                entropy_top1 = routing_comparison["entropy"]["top1"]
-                gate_top1 = routing_comparison["gate"]["top1"]
-                logging.info("=" * 70)
-                logging.info("FINAL CNN COMPARISON after Task {}".format(task))
-                logging.info("Entropy routing top1: {:.2f}".format(entropy_top1))
-                logging.info("Gate routing top1   : {:.2f}".format(gate_top1))
-                logging.info("Delta (gate-entropy): {:+.2f}".format(gate_top1 - entropy_top1))
-                logging.info("=" * 70)
             logging.info("NME: {}".format(nme_accy["grouped"]))
 
             cnn_keys = [key for key in cnn_accy["grouped"].keys() if '-' in key]    
@@ -130,31 +115,11 @@ def _train(args):
 
             logging.info("Average Accuracy (CNN): {}".format(sum(cnn_curve["top1"])/len(cnn_curve["top1"])))
             logging.info("Average Accuracy (NME): {}".format(sum(nme_curve["top1"])/len(nme_curve["top1"])))
-            if gate_accy is not None:
-                gate_curve["top1"].append(gate_accy["top1"])
-                logging.info("Average Accuracy (Gate): {}".format(sum(gate_curve["top1"]) / len(gate_curve["top1"])))
+            if eval_metrics is not None:
+                _log_eval_metrics(task, eval_metrics, eval_wall_seconds)
         else:
             logging.info("No NME accuracy.")
             logging.info("CNN: {}".format(cnn_accy["grouped"]))
-            if routing_comparison is not None:
-                logging.info(
-                    "CNN (ENTROPY ROUTING): {}".format(
-                        routing_comparison["entropy"]["grouped"]
-                    )
-                )
-                logging.info(
-                    "CNN (GATE ROUTING): {}".format(
-                        routing_comparison["gate"]["grouped"]
-                    )
-                )
-                entropy_top1 = routing_comparison["entropy"]["top1"]
-                gate_top1 = routing_comparison["gate"]["top1"]
-                logging.info("=" * 70)
-                logging.info("FINAL CNN COMPARISON after Task {}".format(task))
-                logging.info("Entropy routing top1: {:.2f}".format(entropy_top1))
-                logging.info("Gate routing top1   : {:.2f}".format(gate_top1))
-                logging.info("Delta (gate-entropy): {:+.2f}".format(gate_top1 - entropy_top1))
-                logging.info("=" * 70)
 
             cnn_keys = [key for key in cnn_accy["grouped"].keys() if '-' in key]
             cnn_values = [cnn_accy["grouped"][key] for key in cnn_keys]
@@ -168,9 +133,8 @@ def _train(args):
 
             print('Average Accuracy (CNN):', sum(cnn_curve["top1"])/len(cnn_curve["top1"]))
             logging.info("Average Accuracy (CNN): {} \n".format(sum(cnn_curve["top1"])/len(cnn_curve["top1"])))
-            if gate_accy is not None:
-                gate_curve["top1"].append(gate_accy["top1"])
-                logging.info("Average Accuracy (Gate): {}".format(sum(gate_curve["top1"]) / len(gate_curve["top1"])))
+            if eval_metrics is not None:
+                _log_eval_metrics(task, eval_metrics, eval_wall_seconds)
 
     if 'print_forget' in args.keys() and args['print_forget'] is True:
         if len(cnn_matrix) > 0:
@@ -221,3 +185,26 @@ def _set_random(seed=1):
 def print_args(args):
     for key, value in args.items():
         logging.info("{}: {}".format(key, value))
+
+
+def _log_eval_metrics(task, eval_metrics, eval_wall_seconds):
+    logging.info("Task {} eval time: {:.2f}s".format(task, eval_wall_seconds))
+
+    if "eval_seconds" in eval_metrics:
+        logging.info(
+            "Eval time: {:.2f}s ({:.3f} ms/sample)".format(
+                eval_metrics["eval_seconds"],
+                eval_metrics.get("ms_per_sample", 0.0),
+            )
+        )
+
+    routing_flops = eval_metrics.get("routing_flops")
+    if routing_flops is not None:
+        logging.info(
+            "Routing FLOPs => per_sample: {}, per_batch@{}: {}, num_tasks: {}".format(
+                routing_flops["per_sample"],
+                routing_flops["batch_size"],
+                routing_flops["per_batch"],
+                routing_flops["num_tasks"],
+            )
+        )

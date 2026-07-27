@@ -8,10 +8,9 @@ def get_backbone(args, pretrained=False):
     name = args["backbone_type"].lower()
     type = args["model_name"].lower()
     
-    if type == "adaptive_gating_tosca":
+    if type == "tosca" and name.endswith("_adapter"):
         ffn_num = args["ffn_num"]
         from backbone import vit_adapter
-        from backbone import adaptive_tosca
         from easydict import EasyDict
         tuning_config = EasyDict(
                     # AdaptFormer
@@ -29,15 +28,17 @@ def get_backbone(args, pretrained=False):
         if name == "pretrained_vit_b16_224_adapter" or name == "vit_b16_224_adapter":
             model = vit_adapter.vit_base_patch16_224_adapter(num_classes=0,
                         global_pool=False, drop_path_rate=0.0, tuning_config=tuning_config)
-            
-            model = adaptive_tosca.ToscaAdaptiveViT(model, args["mlp_ratio"], args["se_ratio"], args['flow'], args['M'])
+
+            from backbone import vit_tosca
+            model = vit_tosca.ToscaViT(model, args["mlp_ratio"], args["se_ratio"], args["flow"])
             model.out_dim=768
             return model.eval()
         elif name == "pretrained_vit_b16_224_in21k_adapter" or name == "vit_b16_224_in21k_adapter":
             model = vit_adapter.vit_base_patch16_224_in21k_adapter(num_classes=0,
                         global_pool=False, drop_path_rate=0.0, tuning_config=tuning_config)
-        
-            model = adaptive_tosca.ToscaAdaptiveViT(model, args["mlp_ratio"], args["se_ratio"], args['flow'], args['M'])
+
+            from backbone import vit_tosca
+            model = vit_tosca.ToscaViT(model, args["mlp_ratio"], args["se_ratio"], args["flow"])
             model.out_dim=768
             return model.eval()
         else:
@@ -153,41 +154,5 @@ class SimpleVitNet(BaseNet):
     def forward(self, x):
         x = self.backbone(x)
         out = self.fc(x)
-        out.update({"features": x})
-        return out
-
-
-class SimpleAdaptiveVitNet(BaseNet):
-    def __init__(self, args, pretrained):
-        super().__init__(args, pretrained)
-
-    @property
-    def feature_dim(self):
-        return self.backbone.M
-
-    def update_fc(self, nb_classes, nextperiod_initialization=None):
-        feature_dim = self.feature_dim
-        fc = self.generate_fc(feature_dim, nb_classes).to(self._device)
-        if self.fc is not None:
-            weight = copy.deepcopy(self.fc.weight.data)
-            fc.sigma.data = self.fc.sigma.data
-            if nextperiod_initialization is not None:
-                weight = torch.cat([weight, nextperiod_initialization])
-            else:
-                weight = torch.cat([weight, torch.zeros(
-                    nb_classes - self.fc.out_features, feature_dim).to(self._device)])
-            fc.weight = nn.Parameter(weight)
-        del self.fc
-        self.fc = fc
-
-    def generate_fc(self, in_dim, out_dim):
-        return CosineLinear(in_dim, out_dim)
-
-    def extract_vector(self, x):
-        return self.backbone(x)
-
-    def forward(self, x):
-        x = self.backbone(x)         # [B, M]
-        out = self.fc(x)             # cosine logits over classes
         out.update({"features": x})
         return out

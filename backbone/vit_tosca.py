@@ -2,47 +2,49 @@ import torch
 import torch.nn as nn
 import torch.nn.init as init
 
+
 class Tosca(nn.Module):
-    def __init__(self, dim, mlp_ratio=16, se_ratio=16, flow='tosca'):
+    def __init__(self, dim, mlp_ratio=16, se_ratio=16, flow="tosca"):
         super().__init__()
         self.flow = flow
         self.norm = nn.LayerNorm(dim)
-        
+
         # MLP part
         self.mlp = nn.Sequential(
             nn.Linear(dim, dim // mlp_ratio),
             nn.GELU(),
-            nn.Linear(dim // mlp_ratio, dim)
+            nn.Linear(dim // mlp_ratio, dim),
         )
-        
+
         # SE part
         self.se = nn.Sequential(
             nn.Linear(dim, dim // se_ratio, bias=False),
             nn.ReLU(),
             nn.Linear(dim // se_ratio, dim, bias=False),
-            nn.Sigmoid()
+            nn.Sigmoid(),
         )
 
     def forward(self, x):
-        if self.flow=='calibrator':
+        if self.flow == "calibrator":
             se_weight = self.se(x)
             out = x * se_weight
 
-        elif self.flow=='adapter':
-            mlp_out= self.norm(self.mlp(x))
+        elif self.flow == "adapter":
+            mlp_out = self.norm(self.mlp(x))
             return mlp_out
-        
-        elif self.flow=='tosca_r':
+
+        elif self.flow == "tosca_r":
             se_weight = self.se(x)
-            mlp_out= self.norm(self.mlp(x))
+            mlp_out = self.norm(self.mlp(x))
             out = x * se_weight + mlp_out
 
-        elif self.flow=='tosca':
-            mlp_out= self.norm(x + self.mlp(x))
+        elif self.flow == "tosca":
+            mlp_out = self.norm(x + self.mlp(x))
             se_weight = self.se(mlp_out)
             out = mlp_out * se_weight
 
         return out
+
 
 class ToscaViT(nn.Module):
     def __init__(self, model, mlp_ratio, se_ratio, flow):
@@ -57,6 +59,8 @@ class ToscaViT(nn.Module):
 
     def forward_features(self, x):
         x = self.vit.forward_features(x)
+        if x.dim() == 2:
+            return x
         x = self.vit.pool(x)
         x = self.vit.fc_norm(x)
         return x
@@ -69,7 +73,7 @@ class ToscaViT(nn.Module):
         x = self.forward_features(x)
         x = self.forward_tosca(x)
         return x
-    
+
     def reset_tosca(self):
         for m in self.tosca.modules():
             if isinstance(m, nn.Linear):
@@ -77,5 +81,5 @@ class ToscaViT(nn.Module):
                 if m.bias is not None:
                     init.zeros_(m.bias)
             elif isinstance(m, nn.LayerNorm):
-                init.ones_(m.weight) 
+                init.ones_(m.weight)
                 init.zeros_(m.bias)
