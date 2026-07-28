@@ -244,9 +244,8 @@ class iImageNetA(iData):
     class_order = np.arange(200).tolist()
 
     def download_data(self):
-        assert 0, "You should specify the folder of your dataset"
-        train_dir = "[DATA-PATH]/train/"
-        test_dir = "[DATA-PATH]/test/"
+        train_dir = "data/imagenet-a/train/"
+        test_dir = "data/imagenet-a/test/"
 
         train_dset = datasets.ImageFolder(train_dir)
         test_dset = datasets.ImageFolder(test_dir)

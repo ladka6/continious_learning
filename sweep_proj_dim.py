@@ -67,6 +67,8 @@ def main():
 
     base_args = load_json(cli.config)
     seed = base_args["seed"][0]
+    # Match the trainer: Learner._ckpt_dir tags checkpoints with the scalar seed.
+    base_args["seed"] = seed
     _set_random(seed)
     _set_device(base_args)
 

@@ -6,6 +6,12 @@ import time
 from utils import factory
 from utils.data_manager import DataManager
 from utils.toolkit import count_parameters
+from utils.efficiency import (
+    MetricsLogger,
+    PhaseTimer,
+    dir_size_mb,
+    inference_flops_per_sample,
+)
 import os
 import numpy as np
 
@@ -66,25 +72,44 @@ def _train(args):
 
     cnn_curve, nme_curve = {"top1": [], "top5": []}, {"top1": [], "top5": []}
     cnn_matrix, nme_matrix = [], []
+    metrics_log = MetricsLogger(logfilename + "_metrics.json", args)
 
     for task in range(data_manager.nb_tasks):
         logging.info("All params: {}".format(count_parameters(model._network)))
         logging.info(
             "Trainable params: {}".format(count_parameters(model._network, True))
         )
-        task_wall_start = time.perf_counter()
-        model.incremental_train(data_manager)
-        task_train_only_seconds = time.perf_counter() - task_wall_start
+        with PhaseTimer() as train_phase:
+            model.incremental_train(data_manager)
         logging.info(
             "Task {} wall-clock training time: {:.2f}s".format(
-                task, task_train_only_seconds
+                task, train_phase.seconds
             )
         )
-        eval_wall_start = time.perf_counter()
-        eval_result = model.eval_task()
-        eval_wall_seconds = time.perf_counter() - eval_wall_start
+        with PhaseTimer() as eval_phase:
+            eval_result = model.eval_task()
+        eval_wall_seconds = eval_phase.seconds
         cnn_accy, nme_accy = eval_result[0], eval_result[1]
         eval_metrics = eval_result[2] if len(eval_result) > 2 else None
+        infer_flops = inference_flops_per_sample(model, model.test_loader.dataset)
+        metrics_log.log_task(
+            task,
+            train_seconds=train_phase.seconds,
+            train_peak_mem_mb=train_phase.peak_mb,
+            eval_seconds=eval_phase.seconds,
+            eval_peak_mem_mb=eval_phase.peak_mb,
+            eval_ms_per_sample=(
+                1000.0 * eval_phase.seconds / max(len(model.test_loader.dataset), 1)
+            ),
+            inference_flops_per_sample=infer_flops,
+            total_params=count_parameters(model._network),
+            trainable_params=count_parameters(model._network, True),
+            train_samples=len(model.train_loader.dataset),
+            checkpoint_mb=dir_size_mb(model._ckpt_dir()),
+            timing_breakdown=model._latest_task_timing,
+            routing_flops=(eval_metrics or {}).get("routing_flops"),
+            cnn_top1=cnn_accy["top1"],
+        )
         model.after_task()
 
         if nme_accy is not None:

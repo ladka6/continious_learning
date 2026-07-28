@@ -6,3 +6,4 @@
 *.pyc
 # SLURM output logs
 *.out
+Screenshot*

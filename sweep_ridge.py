@@ -40,6 +40,9 @@ def main():
 
     args = load_json(cli.config)
     seed = args["seed"][0]
+    # Learner._ckpt_dir tags checkpoints with the scalar seed; match the
+    # trainer, which sets args["seed"] = seed before building the model.
+    args["seed"] = seed
     _set_random(seed)
     _set_device(args)
 
