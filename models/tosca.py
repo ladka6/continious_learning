@@ -30,8 +30,8 @@ class Learner(BaseLearner):
         self._tosca_state_cache = {}
 
         # Ridge classifiers (RanPAC-style decorrelation). Shared random
-        # projection P + Gram/class-sum accumulators so lambda stays
-        # re-solvable at eval time (offline lambda sweep, no retraining).
+        # projection P + Gram/class-sum accumulators, held IN MEMORY for the
+        # whole run so any previously routed task can still be scored.
         # Inference (ridge_scope "global_router"): the global ridge on the
         # frozen features routes top-1 to a task, then that task's
         # TOSCA-expert ridge head classifies within the task.
@@ -42,6 +42,12 @@ class Learner(BaseLearner):
                 f"(got use_ridge={self.args.get('use_ridge')}, "
                 f"ridge_scope={self._ridge_scope!r})."
             )
+        # G/C are only ever needed in-memory for the current process (the
+        # live run keeps every task's G/C around so any previously routed
+        # task can still be scored). Disk persistence saves just the SOLVED
+        # W (a few KB) for reproducibility/inspection -- not the raw G/C
+        # (a dense [M, M] Gram matrix, ~900MB at M=15000 PER TASK; a 20-task
+        # dataset x 5 seeds at raw G/C would need ~100GB).
         self._ridge_P = None  # [feat_dim, M] fixed random projection
         self._ridge_G = {}  # task_idx -> [M, M]  (Phi^T Phi)
         self._ridge_C = {}  # task_idx -> [M, inc] (Phi^T Y_onehot)
@@ -543,37 +549,25 @@ class Learner(BaseLearner):
         self._network.load_state_dict(current_state_dict)
 
     def _save_ridge_state(self):
-        """Persist the closed-form ridge matrices (G, C) so lambda/route-topk
-        can be swept offline later -- re-solving W=(G+lam*I)^-1 C from these
-        needs no retraining, no gradient step, not even the training images."""
+        """Persist the SOLVED ridge weights W (not the raw G/C Gram
+        matrices) for reproducibility/inspection -- a few KB total, vs. G
+        being a dense [M, M] matrix (~900MB at M=15000 PER TASK). The global
+        snapshot uses a single fixed filename since only the latest one is
+        ever needed once training has moved past a task."""
         t = self._cur_task
         ckpt_dir = self._ckpt_dir()
+        lam = float(self.args.get("ridge_lambda", 1e4))
         if t in self._ridge_G:
             torch.save(
-                {"G": self._ridge_G[t].cpu(), "C": self._ridge_C[t].cpu()},
+                {"W": self._ridge_weight(t, lam).cpu(), "lambda": lam},
                 os.path.join(ckpt_dir, f"ridge_task{t}.pth"),
             )
         if self._ridge_G_global is not None:
             torch.save(
-                {
-                    "G": self._ridge_G_global.cpu(),
-                    "C": self._ridge_C_global.cpu(),
-                },
-                os.path.join(ckpt_dir, f"ridge_global_task{t}.pth"),
+                {"W": self._global_ridge_weight(lam).cpu(), "lambda": lam},
+                os.path.join(ckpt_dir, "ridge_global.pth"),
             )
-        logging.info("Ridge state saved for task %s.", t)
-
-    def _load_ridge_task(self, task_idx):
-        path = os.path.join(self._ckpt_dir(), f"ridge_task{task_idx}.pth")
-        state = torch.load(path, map_location=self._device)
-        self._ridge_G[task_idx] = state["G"].to(self._device)
-        self._ridge_C[task_idx] = state["C"].to(self._device)
-
-    def _load_ridge_global(self, task_idx):
-        path = os.path.join(self._ckpt_dir(), f"ridge_global_task{task_idx}.pth")
-        state = torch.load(path, map_location=self._device)
-        self._ridge_G_global = state["G"].to(self._device)
-        self._ridge_C_global = state["C"].to(self._device)
+        logging.info("Ridge state (solved W) saved for task %s.", t)
 
     def _save_tosca(self):
         path = os.path.join(self._ckpt_dir(), f"task{self._cur_task}.pth")

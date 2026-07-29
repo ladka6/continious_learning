@@ -95,16 +95,9 @@ Inference uses ridge routing (`ridge_scope: "global_router"` in every config): a
 python main.py --config=./exps/tosca_[DATASET]_ridge_router.json
 ```
 
-Logs are saved to `logs/<model>/<dataset>/<init_cls>/<increment>/` and per-task TOSCA checkpoints + ridge matrices to `tosca/<dataset>__<prefix>/`.
+Logs (+ per-task efficiency metrics JSON) are saved to `logs/<model>/<dataset>/<init_cls>/<increment>/`, and per-task TOSCA checkpoints + solved ridge weights to `tosca/<dataset>__<prefix>__seed<seed>/`.
 
-Offline sweeps (no retraining) over saved runs:
-
-```bash
-python sweep_ridge.py --config exps/tosca_ina_ridge_router.json --lambdas 10,100,1000,10000,100000 --task -1
-python sweep_proj_dim.py --config exps/tosca_ina_ridge_router.json --proj-dims 2000,5000,10000
-```
-
-Full-retrain hyperparameter grids (SLURM) can be generated with `gen_grid_configs.py`.
+Run `python aggregate_results.py` afterward to build accuracy/efficiency tables (mean +/- std over seeds) from the logged metrics.
 
 ### ⚙️ Hyperparameters
 
