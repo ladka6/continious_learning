@@ -94,7 +94,7 @@ class Learner(BaseLearner):
             np.arange(0, self._total_classes), source="test", mode="test"
         )
         self.test_loader = DataLoader(
-            test_dataset, batch_size=48, shuffle=True, num_workers=num_workers
+            test_dataset, batch_size=48, shuffle=False, num_workers=num_workers
         )
 
         train_dataset_for_protonet = data_manager.get_dataset(
