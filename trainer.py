@@ -32,8 +32,9 @@ def _train(args):
     logs_name = "logs/{}/{}/{}/{}".format(args["model_name"],args["dataset"], init_cls, args['increment'])
     
     os.makedirs("tosca", exist_ok=True)
-    if not os.path.exists(logs_name):
-        os.makedirs(logs_name)
+    # exist_ok=True: concurrent array tasks (5 seeds of the same dataset)
+    # share this directory and race to create it if checked-then-created.
+    os.makedirs(logs_name, exist_ok=True)
 
     logfilename = "logs/{}/{}/{}/{}/{}_{}_{}".format(
         args["model_name"],
