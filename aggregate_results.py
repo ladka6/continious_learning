@@ -61,6 +61,21 @@ TRAIN_ONLY_TASK0 = {"ranpac", "aper_adapter"}
 # exact, not a guess.
 EPOCHS_OVERRIDE = {"ease": 20}
 
+# EASE and MOS keep one adapter per task and ENSEMBLE across all of them at
+# eval time -- inference_flops_per_sample genuinely grows ~linearly with the
+# number of tasks seen (verified: ease_cifar224's final-task value / 20
+# tasks ~ 35.4 GFLOPs, matching the base ViT-B/16 cost seen for every other
+# method). That's real and worth reporting as-is for the Inference GFLOPs
+# column. But during TRAINING these methods only forward through the
+# CURRENT task's single new adapter, not the full accumulated ensemble --
+# using each task's own (increasingly ensemble-inflated) inference cost as
+# the per-sample training-forward proxy overestimates later tasks' training
+# FLOPs by ~n_tasks_so_far x, compounding across the run (this produced
+# ease_cifar224's ~1.1 BILLION GFLOPs estimate against a measured 1.9h
+# wall-clock train time). Use task 0's inference cost -- measured before any
+# ensembling has accumulated -- as a constant single-adapter proxy instead.
+ENSEMBLE_EVAL_METHODS = {"ease", "mos"}
+
 
 def load_runs(roots):
     """-> {(model, dataset): {seed: run_dict}}"""
@@ -97,10 +112,14 @@ def per_seed_summary(run):
     curve = [t.get("cnn_top1") for t in tasks if t.get("cnn_top1") is not None]
     epochs = meta.get("epochs") or EPOCHS_OVERRIDE.get(model_name) or 0
     train_only_task0 = model_name in TRAIN_ONLY_TASK0
+    ensemble_eval = model_name in ENSEMBLE_EVAL_METHODS
+    base_f = tasks[0].get("inference_flops_per_sample") if ensemble_eval else None
     train_flops_est = 0.0
     have_flops = True
     for i, t in enumerate(tasks):
         f, n = t.get("inference_flops_per_sample"), t.get("train_samples")
+        if ensemble_eval and base_f:
+            f = base_f
         if not (f and n):
             have_flops = False
             continue
