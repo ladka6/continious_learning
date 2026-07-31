@@ -19,7 +19,7 @@
   "l1": 0.0005,
   "flow": "tosca",
   "ffn_num": 64,
-  "epochs": 1,
+  "epochs": 20,
   "batch_size": 48,
   "optimizer": "sgd",
   "scheduler": "cosine",
