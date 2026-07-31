@@ -32,6 +32,12 @@ def load_runs(roots):
     runs = defaultdict(dict)
     for root in roots:
         for path in glob.glob(os.path.join(root, "**", "*_metrics.json"), recursive=True):
+            # PILOT baselines now report eval_shuffle=true (prefix "benchshuf")
+            # as the canonical protocol; skip the old eval_shuffle=false runs
+            # (prefix "bench") so they don't get mixed in or silently picked
+            # over the shuffled ones for the same (model, dataset, seed).
+            if os.path.basename(path).startswith("bench_"):
+                continue
             try:
                 with open(path) as f:
                     run = json.load(f)
