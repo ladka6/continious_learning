@@ -102,11 +102,28 @@ METRICS = [
 ]
 
 
+# Total classes / increment per dataset, used to catch runs truncated by a
+# SLURM timeout. Comparing seeds against each other's max task count (the
+# old heuristic) misses this: if all 5 seeds get killed by the same
+# wall-clock limit, they're all truncated to the same task and look
+# mutually "complete" even though none of them reached the real final task.
+EXPECTED_TASKS = {
+    "cifar224": 100 // 5,
+    "cub": 200 // 10,
+    "imageneta": 200 // 20,
+    "imagenetr": 200 // 20,
+    "omnibenchmark": 300 // 30,
+    "vtab": 50 // 10,
+}
+
+
 def aggregate(runs):
     rows = []
     for (model, dataset), by_seed in sorted(runs.items()):
         summaries = [per_seed_summary(r) for r in by_seed.values()]
-        expected_tasks = max(s["n_tasks"] for s in summaries)
+        expected_tasks = EXPECTED_TASKS.get(dataset)
+        if expected_tasks is None:
+            expected_tasks = max(s["n_tasks"] for s in summaries)
         complete = [s for s in summaries if s["n_tasks"] == expected_tasks]
         row = {
             "model": model,
