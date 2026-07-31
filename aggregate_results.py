@@ -10,9 +10,31 @@ groups runs by (model, dataset), and emits:
   stdout                    the same, human-readable
 
 Training FLOPs are ESTIMATED as 3 x inference_flops_per_sample x
-train_samples x epochs per task (fwd+bwd ~ 3x fwd) -- uniform across all
-methods, since instrumenting every method's inner train loop is not viable.
-Wall-clock train time is the measured ground truth next to it.
+train_samples x epochs per task (fwd+bwd ~ 3x fwd) for methods that train
+every task. Methods in TRAIN_ONLY_TASK0 (ranpac, aper_adapter) only run a
+gradient-based training loop on task 0 -- later tasks are closed-form
+(ridge/prototype), doing a single forward pass over the task's training
+samples for feature extraction, not `epochs` many forward+backward passes.
+Charging every task at the full epoch count (as an earlier version of this
+script did) overestimated these methods' training cost by roughly the
+number of tasks (~20x on a 20-task dataset) -- verified directly against
+models/ranpac.py and models/aper_adapter.py in the PILOT repo, both of
+which literally skip training past task 0
+(`if self._cur_task == 0: ...train... else: pass`).
+
+KNOWN GAP (not fixed here, would need a code change + rerun): TOSCA's own
+total_params excludes its ridge classifier weights (the M=15000-dim
+projection and solved per-task/global-router heads), since they're stored
+as plain attributes on the Learner rather than inside self._network's
+nn.Parameters -- unlike RanPAC, whose equivalent solved ridge weight lives
+inside self._network.fc.weight and IS counted. This makes TOSCA's
+Parameters (M) column look smaller than it should relative to RanPAC's.
+Reconstructing the exact missing count analytically was judged too risky
+(depends on exact per-task/global-router head shapes not fully verified
+from code reading alone); left as a documented caveat for the paper text
+instead of a guessed number.
+
+Wall-clock train time is the measured ground truth next to any of the above.
 
 Usage:
     python aggregate_results.py --roots logs ../pilot_baselines/logs
@@ -25,6 +47,19 @@ import os
 from collections import defaultdict
 
 import numpy as np
+
+# Methods whose gradient-based training only happens on task 0; later tasks
+# are closed-form (ridge/prototype), not `epochs`-many forward+backward
+# passes. See module docstring.
+TRAIN_ONLY_TASK0 = {"ranpac", "aper_adapter"}
+
+# EASE's config uses init_epochs/later_epochs (both 20 in exps/ease.json),
+# not epochs/tuned_epoch, so MetricsLogger's meta capture
+# (args.get("epochs", args.get("tuned_epoch"))) never finds a value and
+# train_gflops_est comes back blank -- even though EASE genuinely trains
+# every task. Both keys share the same value here, so this override is
+# exact, not a guess.
+EPOCHS_OVERRIDE = {"ease": 20}
 
 
 def load_runs(roots):
@@ -58,13 +93,22 @@ def load_runs(roots):
 
 def per_seed_summary(run):
     meta, tasks = run["meta"], run["tasks"]
+    model_name = str(meta.get("model_name"))
     curve = [t.get("cnn_top1") for t in tasks if t.get("cnn_top1") is not None]
-    epochs = meta.get("epochs") or 0
+    epochs = meta.get("epochs") or EPOCHS_OVERRIDE.get(model_name) or 0
+    train_only_task0 = model_name in TRAIN_ONLY_TASK0
     train_flops_est = 0.0
     have_flops = True
-    for t in tasks:
+    for i, t in enumerate(tasks):
         f, n = t.get("inference_flops_per_sample"), t.get("train_samples")
-        if f and n and epochs:
+        if not (f and n):
+            have_flops = False
+            continue
+        if train_only_task0 and i > 0:
+            # Closed-form task: one forward pass over the task's training
+            # samples for feature extraction, no backward, no epoch loop.
+            train_flops_est += 1.0 * f * n
+        elif epochs:
             train_flops_est += 3.0 * f * n * epochs
         else:
             have_flops = False
