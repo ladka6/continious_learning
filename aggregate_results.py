@@ -76,6 +76,37 @@ EPOCHS_OVERRIDE = {"ease": 20}
 # ensembling has accumulated -- as a constant single-adapter proxy instead.
 ENSEMBLE_EVAL_METHODS = {"ease", "mos"}
 
+# Dedicated reduced-epoch, single-seed runs (config flag profile_train_flops)
+# that measure REAL forward+backward FLOPs via torch.profiler instead of the
+# analytic estimate above. Filename prefix "profileflops_" keeps them
+# entirely separate from the accuracy-bearing 5-seed runs -- they use far
+# fewer epochs, so their own accuracy/timing numbers are meaningless and
+# must never be mixed into the accuracy or seed-averaged efficiency tables.
+PROFILE_PREFIX = "profileflops_"
+
+
+def load_profiled_flops(roots):
+    """-> {(model, dataset): [task_dicts]} from dedicated profiling runs.
+    Used only to replace the analytic train_gflops_est with a measured
+    value where available; never contributes to accuracy numbers."""
+    profiled = {}
+    for root in roots:
+        for path in glob.glob(os.path.join(root, "**", "*_metrics.json"), recursive=True):
+            if not os.path.basename(path).startswith(PROFILE_PREFIX):
+                continue
+            try:
+                with open(path) as f:
+                    run = json.load(f)
+            except (OSError, json.JSONDecodeError):
+                print(f"skipping unreadable {path}")
+                continue
+            meta, tasks = run.get("meta", {}), run.get("tasks", [])
+            if not tasks:
+                continue
+            key = (str(meta.get("model_name")), str(meta.get("dataset")))
+            profiled[key] = tasks
+    return profiled
+
 
 def load_runs(roots):
     """-> {(model, dataset): {seed: run_dict}}"""
@@ -86,7 +117,8 @@ def load_runs(roots):
             # as the canonical protocol; skip the old eval_shuffle=false runs
             # (prefix "bench") so they don't get mixed in or silently picked
             # over the shuffled ones for the same (model, dataset, seed).
-            if os.path.basename(path).startswith("bench_"):
+            basename = os.path.basename(path)
+            if basename.startswith("bench_") or basename.startswith(PROFILE_PREFIX):
                 continue
             try:
                 with open(path) as f:
@@ -106,31 +138,52 @@ def load_runs(roots):
     return runs
 
 
-def per_seed_summary(run):
+def per_seed_summary(run, profiled_tasks=None):
     meta, tasks = run["meta"], run["tasks"]
     model_name = str(meta.get("model_name"))
     curve = [t.get("cnn_top1") for t in tasks if t.get("cnn_top1") is not None]
     epochs = meta.get("epochs") or EPOCHS_OVERRIDE.get(model_name) or 0
-    train_only_task0 = model_name in TRAIN_ONLY_TASK0
-    ensemble_eval = model_name in ENSEMBLE_EVAL_METHODS
-    base_f = tasks[0].get("inference_flops_per_sample") if ensemble_eval else None
-    train_flops_est = 0.0
-    have_flops = True
-    for i, t in enumerate(tasks):
-        f, n = t.get("inference_flops_per_sample"), t.get("train_samples")
-        if ensemble_eval and base_f:
-            f = base_f
-        if not (f and n):
-            have_flops = False
-            continue
-        if train_only_task0 and i > 0:
-            # Closed-form task: one forward pass over the task's training
-            # samples for feature extraction, no backward, no epoch loop.
-            train_flops_est += 1.0 * f * n
-        elif epochs:
-            train_flops_est += 3.0 * f * n * epochs
-        else:
-            have_flops = False
+
+    if profiled_tasks and len(profiled_tasks) >= len(tasks):
+        # Real torch.profiler-measured FLOPs available for this (model,
+        # dataset) from a dedicated reduced-epoch profiling run. Scale each
+        # task's measured FLOPs by (this run's real epoch count / the
+        # profiling run's reduced epoch count) -- tasks that measured near
+        # zero (e.g. adapt-once methods' later, non-training tasks) stay
+        # correctly near zero regardless of the scale factor, since the
+        # measurement itself (not an assumption) determined that.
+        train_flops_est = 0.0
+        have_flops = True
+        for i in range(len(tasks)):
+            pt = profiled_tasks[i]
+            measured = pt.get("train_flops_measured")
+            profiled_epochs = pt.get("profiled_epochs")
+            if measured is None:
+                have_flops = False
+                continue
+            scale = (epochs / profiled_epochs) if (epochs and profiled_epochs) else 1.0
+            train_flops_est += measured * scale
+    else:
+        train_only_task0 = model_name in TRAIN_ONLY_TASK0
+        ensemble_eval = model_name in ENSEMBLE_EVAL_METHODS
+        base_f = tasks[0].get("inference_flops_per_sample") if ensemble_eval else None
+        train_flops_est = 0.0
+        have_flops = True
+        for i, t in enumerate(tasks):
+            f, n = t.get("inference_flops_per_sample"), t.get("train_samples")
+            if ensemble_eval and base_f:
+                f = base_f
+            if not (f and n):
+                have_flops = False
+                continue
+            if train_only_task0 and i > 0:
+                # Closed-form task: one forward pass over the task's training
+                # samples for feature extraction, no backward, no epoch loop.
+                train_flops_est += 1.0 * f * n
+            elif epochs:
+                train_flops_est += 3.0 * f * n * epochs
+            else:
+                have_flops = False
     last = tasks[-1]
     return {
         "n_tasks": len(tasks),
@@ -180,10 +233,12 @@ EXPECTED_TASKS = {
 }
 
 
-def aggregate(runs):
+def aggregate(runs, profiled=None):
+    profiled = profiled or {}
     rows = []
     for (model, dataset), by_seed in sorted(runs.items()):
-        summaries = [per_seed_summary(r) for r in by_seed.values()]
+        profiled_tasks = profiled.get((model, dataset))
+        summaries = [per_seed_summary(r, profiled_tasks) for r in by_seed.values()]
         expected_tasks = EXPECTED_TASKS.get(dataset)
         if expected_tasks is None:
             expected_tasks = max(s["n_tasks"] for s in summaries)
@@ -226,11 +281,16 @@ def main():
     parser.add_argument("--out", type=str, default="results")
     cli = parser.parse_args()
 
-    runs = load_runs([r for r in cli.roots if os.path.isdir(r)])
+    valid_roots = [r for r in cli.roots if os.path.isdir(r)]
+    runs = load_runs(valid_roots)
     if not runs:
         print("No *_metrics.json found under: " + ", ".join(cli.roots))
         return
-    rows = aggregate(runs)
+    profiled = load_profiled_flops(valid_roots)
+    if profiled:
+        print(f"Using measured train_gflops_est for {len(profiled)} (model, dataset) "
+              f"pair(s) with dedicated profiling runs.")
+    rows = aggregate(runs, profiled)
     os.makedirs(cli.out, exist_ok=True)
 
     acc_cols = ["model", "dataset", "seeds", "seeds_partial"] + [

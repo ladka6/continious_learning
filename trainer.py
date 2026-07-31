@@ -11,6 +11,7 @@ from utils.efficiency import (
     PhaseTimer,
     dir_size_mb,
     inference_flops_per_sample,
+    profile_flops,
 )
 import os
 import numpy as np
@@ -80,8 +81,22 @@ def _train(args):
         logging.info(
             "Trainable params: {}".format(count_parameters(model._network, True))
         )
-        with PhaseTimer() as train_phase:
-            model.incremental_train(data_manager)
+        # Opt-in (config flag `profile_train_flops`, off by default): measure
+        # the REAL forward+backward FLOPs of this task's actual training
+        # call via torch.profiler, instead of the analytic 3x-forward
+        # estimate computed later in aggregate_results.py. Real profiling
+        # naturally captures partial-freeze nuances (e.g. only backbone.tosca
+        # + fc need gradients on tasks > 0) without special-casing. Off by
+        # default -- meant for short, reduced-epoch dedicated runs.
+        train_flops_measured = None
+        if args.get("profile_train_flops", False):
+            with PhaseTimer() as train_phase:
+                train_flops_measured = profile_flops(
+                    model.incremental_train, data_manager
+                )
+        else:
+            with PhaseTimer() as train_phase:
+                model.incremental_train(data_manager)
         logging.info(
             "Task {} wall-clock training time: {:.2f}s".format(
                 task, train_phase.seconds
@@ -106,6 +121,10 @@ def _train(args):
             total_params=count_parameters(model._network),
             trainable_params=count_parameters(model._network, True),
             train_samples=len(model.train_loader.dataset),
+            train_flops_measured=train_flops_measured,
+            profiled_epochs=(
+                args.get("epochs") if args.get("profile_train_flops", False) else None
+            ),
             checkpoint_mb=dir_size_mb(model._ckpt_dir()),
             timing_breakdown=model._latest_task_timing,
             routing_flops=(eval_metrics or {}).get("routing_flops"),
