@@ -252,6 +252,30 @@ class Learner(BaseLearner):
             inc,
         )
 
+    def ridge_extra_param_count(self):
+        """Element count of the ridge classifier weights that live outside
+        self._network (the random projection P and every solved head),
+        so count_parameters(self._network) can be corrected to reflect the
+        model's true total size. Unlike RanPAC -- whose equivalent solved
+        ridge weight replaces self._network.fc.weight and is therefore
+        already counted -- TOSCA's ridge weights are plain Learner
+        attributes/dict entries, invisible to count_parameters().
+
+        Computed from _ridge_C/_ridge_C_global (persisted for every seen
+        task) rather than the lazily-populated _ridge_W_cache, since the
+        cache only holds whichever (task, lambda) pairs eval actually
+        solved for and may not cover every task after a cache-clearing
+        _fit_ridge_head call.
+        """
+        extra = 0
+        if self._ridge_P is not None:
+            extra += self._ridge_P.numel()
+        for c in self._ridge_C.values():
+            extra += c.numel()
+        if self._ridge_C_global is not None:
+            extra += self._ridge_C_global.numel()
+        return extra
+
     def _ridge_weight(self, task_idx, lam):
         """W_t = (G_t + lam I)^-1 C_t, cached per (task, lambda). Solved in
         float64 for conditioning, returned float32."""

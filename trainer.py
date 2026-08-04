@@ -118,7 +118,10 @@ def _train(args):
                 1000.0 * eval_phase.seconds / max(len(model.test_loader.dataset), 1)
             ),
             inference_flops_per_sample=infer_flops,
-            total_params=count_parameters(model._network),
+            total_params=(
+                count_parameters(model._network)
+                + getattr(model, "ridge_extra_param_count", lambda: 0)()
+            ),
             trainable_params=count_parameters(model._network, True),
             train_samples=len(model.train_loader.dataset),
             train_flops_measured=train_flops_measured,

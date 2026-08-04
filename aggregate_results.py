@@ -22,17 +22,21 @@ models/ranpac.py and models/aper_adapter.py in the PILOT repo, both of
 which literally skip training past task 0
 (`if self._cur_task == 0: ...train... else: pass`).
 
-KNOWN GAP (not fixed here, would need a code change + rerun): TOSCA's own
-total_params excludes its ridge classifier weights (the M=15000-dim
-projection and solved per-task/global-router heads), since they're stored
-as plain attributes on the Learner rather than inside self._network's
-nn.Parameters -- unlike RanPAC, whose equivalent solved ridge weight lives
-inside self._network.fc.weight and IS counted. This makes TOSCA's
-Parameters (M) column look smaller than it should relative to RanPAC's.
-Reconstructing the exact missing count analytically was judged too risky
-(depends on exact per-task/global-router head shapes not fully verified
-from code reading alone); left as a documented caveat for the paper text
-instead of a guessed number.
+FIXED (was a known gap): TOSCA's own total_params used to exclude its ridge
+classifier weights (the M=15000-dim projection and solved per-task/
+global-router heads), since they're stored as plain attributes on the
+Learner rather than inside self._network's nn.Parameters -- unlike RanPAC,
+whose equivalent solved ridge weight lives inside self._network.fc.weight
+and IS counted by count_parameters(). trainer.py now adds
+model.ridge_extra_param_count() (models/tosca.py) on top of
+count_parameters(model._network) for total_params, computed from the
+persisted per-task/global _ridge_C accumulators (not the lazily-populated
+_ridge_W_cache, which may not cover every seen task). Only affects
+total_params, not trainable_params -- these weights are closed-form
+solved, never requires_grad=True, same as RanPAC's equivalent. Runs logged
+before this fix (any run without the corrected total_params) will still
+show the old, undercounted total_params_m -- rerun to get the corrected
+figure.
 
 Wall-clock train time is the measured ground truth next to any of the above.
 
