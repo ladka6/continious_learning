@@ -173,17 +173,30 @@ EFF_METRICS = [
     ("train_seconds_total", "Train Time (min)", 1.0 / 60.0),
     ("eval_ms_per_sample", "Eval (ms/smp)", 1.0),
     ("inference_gflops_per_sample", "Inference (GFLOPs)", 1.0),
-    ("train_gflops_est", "Train (GFLOPs, est.)", 1.0),
+    ("train_gflops_est", "Train GFLOPs (CIFAR224)", 1.0),
     ("train_peak_mem_mb", "Peak Train Mem (MB)", 1.0),
     ("total_params_m", "Params (M)", 1.0),
     ("trainable_params_m", "Trainable Params (M)", 1.0),
 ]
 
 
+# train_gflops_est is reported for cifar224 ONLY, not averaged across all six
+# datasets like every other column. Only cifar224 has a real torch.profiler
+# measurement for every method (see gen_profile_flops.py); the other five
+# datasets fall back to an analytic estimate, and some methods (e.g.
+# SimpleCIL, which never runs gradient descent so has no `epochs` value at
+# all) have no analytic estimate for those datasets either -- averaging
+# would silently mix real measurements, analytic estimates, and
+# inconsistent dataset counts per method into one number. cifar224-only
+# keeps this column a genuine apples-to-apples comparison: same dataset,
+# same real measurement, for all nine methods.
+CIFAR224_ONLY_METRICS = {"train_gflops_est"}
+
 def build_efficiency_table(rows):
     """One row per method: each metric averaged across whatever datasets have
     data (equal weight per dataset, not per seed -- a dataset with fewer
-    completed seeds doesn't get proportionally more influence)."""
+    completed seeds doesn't get proportionally more influence), except
+    CIFAR224_ONLY_METRICS which use cifar224's own (mean, std) directly."""
     by_key = {(r["model"], r["dataset"]): r for r in rows}
     table = {}
     for model_key, _ in METHODS:
@@ -195,16 +208,27 @@ def build_efficiency_table(rows):
                 continue
             n_datasets += 1
             for metric, _, _ in EFF_METRICS:
+                if metric in CIFAR224_ONLY_METRICS:
+                    continue
                 mean = r.get(f"{metric}_mean")
                 if mean is not None:
                     per_metric.setdefault(metric, []).append(mean)
+        cifar_row = by_key.get((model_key, "cifar224"))
         table[model_key] = {
             "n_datasets": n_datasets,
             **{
                 metric: (float(np.mean(vals)), float(np.std(vals))) if vals else (None, None)
                 for metric, vals in (
                     (m, per_metric.get(m, [])) for m, _, _ in EFF_METRICS
+                    if m not in CIFAR224_ONLY_METRICS
                 )
+            },
+            **{
+                metric: (
+                    (cifar_row.get(f"{metric}_mean"), cifar_row.get(f"{metric}_std"))
+                    if cifar_row else (None, None)
+                )
+                for metric in CIFAR224_ONLY_METRICS
             },
         }
     return table
@@ -278,7 +302,10 @@ def write_efficiency_latex(table, path):
     lines.append("}")
     lines.append(
         "\\caption{Efficiency comparison, mean $\\pm$ std across all six "
-        "datasets (each dataset weighted equally). Lowest cost per column "
+        "datasets (each dataset weighted equally), except Train GFLOPs "
+        "which is measured on CIFAR224 only (via torch.profiler, real "
+        "forward+backward FLOPs) since it is the one dataset with a "
+        "directly measured value for every method. Lowest cost per column "
         "in bold.}"
     )
     lines.append("\\label{tab:efficiency}")
