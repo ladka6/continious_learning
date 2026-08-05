@@ -23,7 +23,7 @@ import os
 
 import numpy as np
 
-from aggregate_results import aggregate, load_runs
+from aggregate_results import aggregate, load_runs, load_profiled_flops
 
 # Internal dataset key -> paper-style column header.
 DATASETS = [
@@ -399,11 +399,16 @@ def main():
     parser.add_argument("--out", type=str, default="results")
     cli = parser.parse_args()
 
-    runs = load_runs([r for r in cli.roots if os.path.isdir(r)])
+    valid_roots = [r for r in cli.roots if os.path.isdir(r)]
+    runs = load_runs(valid_roots)
     if not runs:
         print("No *_metrics.json found under: " + ", ".join(cli.roots))
         return
-    rows = aggregate(runs)
+    profiled = load_profiled_flops(valid_roots)
+    if profiled:
+        print(f"Using measured train_gflops_est for {len(profiled)} (model, dataset) "
+              f"pair(s) with dedicated profiling runs.")
+    rows = aggregate(runs, profiled)
     table = build_table(rows)
     os.makedirs(cli.out, exist_ok=True)
     write_csv(table, os.path.join(cli.out, "paper_table.csv"))
