@@ -145,8 +145,11 @@ class Learner(BaseLearner):
         start = self._task_ranges[self._cur_task][0]
         head = CosineLinear(self._network.feature_dim, inc).to(self._device)
 
+        head_lr = float(self.args["lr"]) * float(
+            self.args.get("head_lr_multiplier", 1.0)
+        )
         optimizer = self.get_optimizer(
-            lr=self.args["lr"], extra_params=head.parameters()
+            lr=self.args["lr"], extra_params=head.parameters(), extra_lr=head_lr
         )
         scheduler = self.get_scheduler(optimizer, self.args["epochs"])
 
@@ -460,26 +463,43 @@ class Learner(BaseLearner):
         label_list = torch.cat(label_list, dim=0)
         self._accumulate_global_ridge(torch.cat(frozen_list, dim=0), label_list)
 
-    def get_optimizer(self, lr, extra_params=None):
-        params = list(filter(lambda p: p.requires_grad, self._network.parameters()))
+    def get_optimizer(self, lr, extra_params=None, extra_lr=None):
+        """extra_params get their OWN param group, at extra_lr (defaults to
+        lr if unset). Needed for the per-task head: it starts from a random
+        init every task (unlike the tosca adapter, which only resets its own
+        small weights, not a from-scratch linear layer), so it can benefit
+        from a higher learning rate than the adapter to converge within the
+        same epoch budget -- particularly on datasets with few samples/task
+        or high domain heterogeneity across tasks (e.g. VTAB), where the old
+        closed-form ridge classifier had no such convergence risk at all."""
+        param_groups = [
+            {
+                "params": list(
+                    filter(lambda p: p.requires_grad, self._network.parameters())
+                ),
+                "lr": lr,
+            }
+        ]
         if extra_params is not None:
-            params += list(extra_params)
+            param_groups.append(
+                {"params": list(extra_params), "lr": extra_lr if extra_lr is not None else lr}
+            )
         if self.args["optimizer"] == "sgd":
             optimizer = optim.SGD(
-                params,
+                param_groups,
                 momentum=0.9,
                 lr=lr,
                 weight_decay=self.args["weight_decay"],
             )
         elif self.args["optimizer"] == "adam":
             optimizer = optim.Adam(
-                params,
+                param_groups,
                 lr=lr,
                 weight_decay=self.args["weight_decay"],
             )
         elif self.args["optimizer"] == "adamw":
             optimizer = optim.AdamW(
-                params,
+                param_groups,
                 lr=lr,
                 weight_decay=self.args["weight_decay"],
             )

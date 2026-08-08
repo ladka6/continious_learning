@@ -548,7 +548,7 @@ RanPAC
 & \result{83.87}{0.52} & \result{78.86}{0.17}
 & \result{63.47}{1.45} & \result{54.73}{0.73}
 & \result{85.84}{0.87} & \result{79.44}{0.35}
-& \result{96.12}{0.56} & \result{92.68}{0.29}
+& \bestresult{96.12}{0.56} & \result{92.68}{0.29}
 \\
 
 L2P
@@ -609,12 +609,12 @@ MOS
 \rowcolor{toscarow}
 
 TOSCA (ours)
-& \bestresult{94.55}{0.67} & \bestresult{91.50}{0.32}
-& \bestresult{93.63}{0.63} & \result{90.13}{0.19}
-& \bestresult{85.94}{0.30} & \bestresult{81.45}{0.21}
-& \bestresult{67.68}{1.88} & \bestresult{59.88}{1.00}
-& \bestresult{86.56}{0.77} & \bestresult{80.46}{0.30}
-& \bestresult{96.32}{0.45} & \bestresult{93.28}{0.06}
+& \bestresult{94.45}{0.65} & \bestresult{91.42}{0.31}
+& \bestresult{93.62}{0.59} & \result{90.08}{0.22}
+& \bestresult{85.84}{0.36} & \bestresult{81.34}{0.31}
+& \bestresult{67.27}{1.79} & \bestresult{59.51}{0.72}
+& \bestresult{86.42}{0.93} & \bestresult{80.36}{0.39}
+& \result{95.87}{0.43} & \bestresult{92.77}{0.19}
 \\
 
 \bottomrule
@@ -633,16 +633,16 @@ TOSCA (ours)
 Method & Train Time (min) & Eval. (ms/smp) & Inference (GFLOPs) & Train (GFLOPs) & Peak Train Mem. (MB) & Params (M) & Trainable Params (M) \\
 \midrule
 SimpleCIL & $\mathbf{2.17 \pm 0.03}$ & $\mathbf{2.42 \pm 0.01}$ & $\mathbf{35.14}$ & $\mathbf{1.76 \times 10^{6}}$ & $\mathbf{1384.09}$ & $\mathbf{85.88}$ & $85.88$ \\
-RanPAC & $12.28 \pm 0.11$ & $2.65 \pm 0.01$ & $35.62$ & $3.98 \times 10^{7}$ & $4415.97$ & $87.99$ & $2.19$ \\
+RanPAC & $12.24 \pm 0.07$ & $2.64 \pm 0.01$ & $35.62$ & $7.36 \times 10^{6}$ & $4415.97$ & $96.67$ & $2.19$ \\
 L2P & $46.43 \pm 0.06$ & $5.65 \pm 0.00$ & $74.91$ & $2.91 \times 10^{7}$ & $2362.72$ & $171.82$ & $\mathbf{0.12}$ \\
 DualPrompt & $42.13 \pm 0.05$ & $5.13 \pm 0.01$ & $70.29$ & $2.65 \times 10^{7}$ & $2832.75$ & $172.00$ & $0.33$ \\
 CODAPrompt & $185.29 \pm 0.32$ & $4.62 \pm 0.00$ & $70.29$ & $1.36 \times 10^{8}$ & $18726.53$ & $89.72$ & $89.72$ \\
-APER-Adapter & $9.28 \pm 0.08$ & $4.91 \pm 0.01$ & $70.74$ & $7.46 \times 10^{7}$ & $4415.97$ & $172.94$ & $87.14$ \\
+APER-Adapter & $9.28 \pm 0.08$ & $4.91 \pm 0.01$ & $70.74$ & $1.07 \times 10^{7}$ & $4415.97$ & $172.94$ & $87.14$ \\
 EASE & $113.95 \pm 2.16$ & $49.03 \pm 0.02$ & $707.69$ & $4.44 \times 10^{8}$ & $4535.86$ & $88.53$ & $2.73$ \\
 MOS & $100.19 \pm 2.90$ & $52.80 \pm 0.17$ & $740.37$ & $1.40 \times 10^{8}$ & $4650.50$ & $92.34$ & $6.47$ \\
 \midrule
 \rowcolor{toscarow}
-TOSCA (ours) & $50.72 \pm 0.15$ & $3.62 \pm 0.01$ & $35.65$ & $7.39 \times 10^{7}$ & $25351.67$ & $101.73$ & $0.23$ \\
+TOSCA (ours) & $51.59 \pm 0.32$ & $3.16 \pm 0.01$ & $35.63$ & $7.34 \times 10^{7}$ & $8178.41$ & $100.23$ & $0.15$ \\
 \bottomrule
 \end{tabular}%
 }
