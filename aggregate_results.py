@@ -55,7 +55,7 @@ import numpy as np
 # Methods whose gradient-based training only happens on task 0; later tasks
 # are closed-form (ridge/prototype), not `epochs`-many forward+backward
 # passes. See module docstring.
-TRAIN_ONLY_TASK0 = {"ranpac", "aper_adapter"}
+TRAIN_ONLY_TASK0 = {"ranpac", "aper_adapter", "aper_finetune", "aper_vpt", "aper_ssf"}
 
 # EASE's config uses init_epochs/later_epochs (both 20 in exps/ease.json),
 # not epochs/tuned_epoch, so MetricsLogger's meta capture
@@ -65,12 +65,12 @@ TRAIN_ONLY_TASK0 = {"ranpac", "aper_adapter"}
 # exact, not a guess.
 EPOCHS_OVERRIDE = {"ease": 20}
 
-# EASE and MOS keep one adapter per task and ENSEMBLE across all of them at
-# eval time -- inference_flops_per_sample genuinely grows ~linearly with the
-# number of tasks seen (verified: ease_cifar224's final-task value / 20
-# tasks ~ 35.4 GFLOPs, matching the base ViT-B/16 cost seen for every other
-# method). That's real and worth reporting as-is for the Inference GFLOPs
-# column. But during TRAINING these methods only forward through the
+# EASE, MOS, and TUNA keep one adapter per task and ENSEMBLE across all of
+# them at eval time -- inference_flops_per_sample genuinely grows ~linearly
+# with the number of tasks seen (verified: ease_cifar224's final-task value /
+# 20 tasks ~ 35.4 GFLOPs, matching the base ViT-B/16 cost seen for every
+# other method). That's real and worth reporting as-is for the Inference
+# GFLOPs column. But during TRAINING these methods only forward through the
 # CURRENT task's single new adapter, not the full accumulated ensemble --
 # using each task's own (increasingly ensemble-inflated) inference cost as
 # the per-sample training-forward proxy overestimates later tasks' training
@@ -78,7 +78,7 @@ EPOCHS_OVERRIDE = {"ease": 20}
 # ease_cifar224's ~1.1 BILLION GFLOPs estimate against a measured 1.9h
 # wall-clock train time). Use task 0's inference cost -- measured before any
 # ensembling has accumulated -- as a constant single-adapter proxy instead.
-ENSEMBLE_EVAL_METHODS = {"ease", "mos"}
+ENSEMBLE_EVAL_METHODS = {"ease", "mos", "tuna"}
 
 # Dedicated reduced-epoch, single-seed runs (config flag profile_train_flops)
 # that measure REAL forward+backward FLOPs via torch.profiler instead of the
@@ -152,10 +152,16 @@ def per_seed_summary(run, profiled_tasks=None):
         # Real torch.profiler-measured FLOPs available for this (model,
         # dataset) from a dedicated reduced-epoch profiling run. Scale each
         # task's measured FLOPs by (this run's real epoch count / the
-        # profiling run's reduced epoch count) -- tasks that measured near
-        # zero (e.g. adapt-once methods' later, non-training tasks) stay
-        # correctly near zero regardless of the scale factor, since the
-        # measurement itself (not an assumption) determined that.
+        # profiling run's reduced epoch count) -- this is only valid for
+        # tasks whose cost actually scales with epoch count (a real
+        # forward+backward loop). TRAIN_ONLY_TASK0 methods (e.g. RanPAC,
+        # APER-Adapter) run the SAME epoch-independent closed-form step for
+        # tasks > 0 in both the profiling run and the real run (see
+        # `else: pass` in their _train), so their post-task-0 measurements
+        # are already the true cost and must NOT be scaled -- doing so
+        # previously inflated their reported Train GFLOPs by ~(epochs /
+        # profiled_epochs), e.g. 20x, compounding across every later task.
+        train_only_task0 = model_name in TRAIN_ONLY_TASK0
         train_flops_est = 0.0
         have_flops = True
         for i in range(len(tasks)):
@@ -165,7 +171,10 @@ def per_seed_summary(run, profiled_tasks=None):
             if measured is None:
                 have_flops = False
                 continue
-            scale = (epochs / profiled_epochs) if (epochs and profiled_epochs) else 1.0
+            if train_only_task0 and i > 0:
+                scale = 1.0
+            else:
+                scale = (epochs / profiled_epochs) if (epochs and profiled_epochs) else 1.0
             train_flops_est += measured * scale
     else:
         train_only_task0 = model_name in TRAIN_ONLY_TASK0
