@@ -1,0 +1,116 @@
+\noindent
+\begin{minipage}{\textwidth}
+\centering
+
+\resizebox{0.78\textwidth}{!}{%
+\begin{tikzpicture}[
+    font=\small,
+    >=Latex,
+    node distance=5mm and 7mm,
+    box/.style={
+        draw=black!55,
+        line width=0.9pt,
+        rounded corners=4pt,
+        align=center,
+        minimum height=8mm,
+        inner sep=3pt,
+        blur shadow={shadow blur steps=6, shadow xshift=0.6pt,
+                      shadow yshift=-1pt, shadow opacity=0.35}
+    },
+    stage/.style={box, fill=blue!12, draw=blue!55!black, minimum width=28mm},
+    expert/.style={box, fill=red!12, draw=red!55!black, minimum width=31mm},
+    ridge/.style={box, fill=green!14, draw=green!45!black, minimum width=31mm},
+    note/.style={box, fill=gray!10, draw=gray!55!black, minimum width=22mm},
+    group/.style={draw=black!35, dashed, rounded corners=4pt, inner sep=4pt},
+    arrow/.style={->, thick, black!70},
+    dashedarrow/.style={->, thick, dashed, black!70},
+    badge/.style={
+        circle,
+        draw=#1!60!black,
+        fill=#1!18,
+        line width=0.6pt,
+        inner sep=1.3pt,
+        font=\scriptsize,
+        blur shadow={shadow blur steps=4, shadow xshift=0.4pt,
+                      shadow yshift=-0.6pt, shadow opacity=0.3}
+    }
+]
+
+% Top row
+\node[stage] (input) {Input image\\$\mathbf{x}$};
+\node[stage, right=of input, minimum width=38mm] (vit) {Frozen ViT backbone\\final \texttt{[CLS]} token\\$\Phi(\mathbf{x})$};
+\node[expert, right=of vit] (expertblock) {Task-specific\\LuCA / TOSCA expert\\$E_t$};
+\node[ridge, right=of expertblock] (localridge) {Task-local ridge head\\$W_t$};
+\node[note, right=of localridge] (pred) {Class\\prediction};
+
+\draw[arrow] (input) -- (vit);
+\draw[arrow] (vit) -- (expertblock);
+\draw[arrow] (expertblock) -- (localridge);
+\draw[arrow] (localridge) -- (pred);
+
+\node[group, fit=(input)(pred)] {};
+
+% Icon badges: frozen backbone, trainable expert, closed-form ridge
+\node[badge=blue] at (vit.north east) {\textcolor{blue!55!black}{\faSnowflake}};
+\node[badge=red] at (expertblock.north east) {\textcolor{red!60!black}{\faFire}};
+\node[badge=green] at (localridge.north east) {\textcolor{green!40!black}{\faBolt}};
+
+% Middle row
+\node[ridge, below=12mm of vit, minimum width=44mm] (proj)
+{Shared random projection\\$\phi(\mathbf{x})=\mathrm{ReLU}(\Phi(\mathbf{x})^\top P)$};
+
+\node[ridge, right=of proj, minimum width=28mm] (router)
+{Global ridge router\\$W^{\mathrm{glob}}$};
+
+\node[note, right=of router] (route)
+{Select routed\\task $\hat{t}$};
+
+\draw[arrow] (vit.south) -- (proj.north);
+\draw[arrow] (proj) -- (router);
+\draw[arrow] (router) -- (route);
+
+\node[group, fit=(proj)(route)] {};
+
+\node[badge=green] at (proj.north east) {\textcolor{green!40!black}{\faBolt}};
+\node[badge=green] at (router.north east) {\textcolor{green!40!black}{\faBolt}};
+
+% Bottom row
+\node[expert, below=12mm of router] (loadexpert)
+{Load only routed\\expert $E_{\hat{t}}$};
+
+\node[ridge, right=of loadexpert] (loadridge)
+{Apply routed\\ridge head $W_{\hat{t}}$};
+
+\node[note, right=of loadridge] (finalpred)
+{Final class\\prediction $\hat{y}$};
+
+\draw[dashedarrow] (route.south) -- ++(0,-3.5mm) -| (loadexpert.north);
+\draw[arrow] (vit.south) |- (loadexpert.west);
+\draw[arrow] (loadexpert) -- (loadridge);
+\draw[arrow] (loadridge) -- (finalpred);
+
+\node[group, fit=(loadexpert)(finalpred)] {};
+
+\node[badge=red] at (loadexpert.north east) {\textcolor{red!60!black}{\faFire}};
+\node[badge=green] at (loadridge.north east) {\textcolor{green!40!black}{\faBolt}};
+
+% Key idea
+\node[note, below=9mm of loadexpert, minimum width=78mm, align=left] (benefit) {
+\textbf{Key idea:}\\
+1.~\textcolor{blue!55!black}{\faSnowflake}\ Keep the ViT mostly frozen for stability.\\
+2.~\textcolor{red!60!black}{\faFire}\ Learn one lightweight TOSCA expert per task.\\
+3.~\textcolor{green!40!black}{\faBolt}\ Replace exhaustive expert search with\\
+\hspace*{4.2mm}a closed-form global ridge router.
+};
+
+% Titles
+\node[font=\bfseries] at ($(input)!0.5!(pred)+(0,10mm)$) {Per-task training};
+\node[font=\bfseries] at ($(proj)!0.5!(route)+(0,9mm)$) {Global task routing};
+\node[font=\bfseries] at ($(loadexpert)!0.5!(finalpred)+(0,9mm)$) {Inference};
+
+\end{tikzpicture}%
+}
+
+\captionof{figure}{Overview of the proposed methodology. During training, each incremental task learns a lightweight TOSCA expert on top of the frozen ViT \texttt{[CLS]} token, together with a task-local ridge classifier. In parallel, a shared random projection and a global ridge model are built in the frozen feature space for exemplar-free task routing. At inference time, the global ridge router predicts the most likely task, after which only the corresponding task expert and its ridge head are activated. This removes the need to evaluate all stored experts for every test sample. Icons mark frozen components (\textcolor{blue!55!black}{\faSnowflake}), trainable task-specific modules (\textcolor{red!60!black}{\faFire}), and closed-form solves (\textcolor{green!40!black}{\faBolt}).}
+\label{fig:method-overview}
+\end{minipage}

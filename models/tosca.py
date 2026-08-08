@@ -36,6 +36,14 @@ class Learner(BaseLearner):
         # standalone CosineLinear modules, never registered inside
         # self._network, so count_parameters(self._network) can't see them.
         self._expert_param_total = 0
+        # Trainable param count of the CURRENT task's expert head at the
+        # moment its training loop finished (see _save_expert_head) --
+        # exposed via expert_head_trainable_param_count() so trainer.py can
+        # correct the "trainable_params" metric it logs right after this
+        # task, since the head is a standalone module count_parameters(
+        # model._network, True) can't see (same visibility gap as
+        # ridge_extra_param_count fixes for total_params).
+        self._latest_head_trainable_params = 0
 
         # Ridge classifiers (RanPAC-style decorrelation). Shared random
         # projection P + Gram/class-sum accumulators, held IN MEMORY for the
@@ -278,6 +286,14 @@ class Learner(BaseLearner):
         extra += self._expert_param_total
         return extra
 
+    def expert_head_trainable_param_count(self):
+        """Trainable param count of the most-recently-trained task's expert
+        head -- see _latest_head_trainable_params. trainer.py adds this to
+        count_parameters(model._network, True) so the logged
+        'trainable_params' for a task includes the head that was actually
+        being gradient-trained during it."""
+        return self._latest_head_trainable_params
+
     def _save_expert_head(self, head):
         """Persist this task's classifier head -- a small CosineLinear
         trained from scratch on just this task's own inc classes (local
@@ -291,7 +307,9 @@ class Learner(BaseLearner):
         state = {"weight": head.weight.detach().cpu()}
         if getattr(head, "sigma", None) is not None:
             state["sigma"] = head.sigma.detach().cpu()
-        self._expert_param_total += sum(p.numel() for p in head.parameters())
+        head_params = sum(p.numel() for p in head.parameters())
+        self._expert_param_total += head_params
+        self._latest_head_trainable_params = head_params
         path = os.path.join(self._ckpt_dir(), f"head_task{t}.pth")
         torch.save(state, path)
         logging.info("Expert head saved for task %s.", t)

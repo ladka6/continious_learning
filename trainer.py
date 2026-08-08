@@ -122,7 +122,10 @@ def _train(args):
                 count_parameters(model._network)
                 + getattr(model, "ridge_extra_param_count", lambda: 0)()
             ),
-            trainable_params=count_parameters(model._network, True),
+            trainable_params=(
+                count_parameters(model._network, True)
+                + getattr(model, "expert_head_trainable_param_count", lambda: 0)()
+            ),
             train_samples=len(model.train_loader.dataset),
             train_flops_measured=train_flops_measured,
             profiled_epochs=(
