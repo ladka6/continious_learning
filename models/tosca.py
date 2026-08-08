@@ -141,9 +141,15 @@ class Learner(BaseLearner):
         # from scratch on this task's own inc classes (local labels), never
         # touched again after this loop. No shared/growing fc, so no
         # cross-task gradient interference to guard against later.
+        # head_use_ridge_features (opt-in, default off): classify in the
+        # same random-projected, ReLU-expanded space the router uses
+        # (_ridge_features) instead of raw tosca-adapted features -- makes
+        # classes more linearly separable with few samples/task, same
+        # reason RanPAC-style random features work well in low-data
+        # regimes. Off by default so existing configs are unaffected.
         inc = self._classes_per_task()
         start = self._task_ranges[self._cur_task][0]
-        head = CosineLinear(self._network.feature_dim, inc).to(self._device)
+        head = CosineLinear(self._head_input_dim(), inc).to(self._device)
 
         head_lr = float(self.args["lr"]) * float(
             self.args.get("head_lr_multiplier", 1.0)
@@ -169,7 +175,7 @@ class Learner(BaseLearner):
 
                 optimizer.zero_grad()
                 feats = self._get_backbone()(inputs)
-                logits = head(feats)["logits"]
+                logits = head(self._head_features(feats))["logits"]
                 loss = F.cross_entropy(logits, local_targets)
                 l1_loss = sum(
                     p.abs().sum() for p in self._network.backbone.tosca.parameters()
@@ -271,6 +277,23 @@ class Learner(BaseLearner):
             phi = F.relu(phi)
         return phi
 
+    def _head_input_dim(self):
+        """Feature dim the per-task expert head classifies over -- the
+        random-projected M-dim ridge space if head_use_ridge_features is
+        set, else raw tosca-adapted features (self._network.feature_dim)."""
+        if bool(self.args.get("head_use_ridge_features", False)):
+            return int(self.args.get("ridge_proj_dim", 5000))
+        return self._network.feature_dim
+
+    def _head_features(self, feats):
+        """Transform tosca-adapted features into whatever space the expert
+        head classifies over (see _head_input_dim). Used both at train time
+        (_train) and at eval time (_routed_ridge_from_tasks) so the two
+        stay consistent."""
+        if bool(self.args.get("head_use_ridge_features", False)):
+            return self._ridge_features(feats)
+        return feats
+
     def ridge_extra_param_count(self):
         """Element count of the classifier weights that live outside
         self._network (the global router's random projection P and solved
@@ -353,10 +376,11 @@ class Learner(BaseLearner):
             row_ids = (topk_tasks == task_idx).any(dim=1).nonzero(as_tuple=True)[0]
             self._load_tosca(task_idx)
             feats = self._get_backbone().forward_tosca(vit_features[row_ids])
+            head_feats = self._head_features(feats)
             head = self._load_expert_head(task_idx)
             weight = head["weight"].to(device)
             scores = F.linear(
-                F.normalize(feats, p=2, dim=1), F.normalize(weight, p=2, dim=1)
+                F.normalize(head_feats, p=2, dim=1), F.normalize(weight, p=2, dim=1)
             )
             if "sigma" in head:
                 scores = head["sigma"].to(device) * scores
