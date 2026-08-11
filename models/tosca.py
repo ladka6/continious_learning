@@ -10,7 +10,7 @@ from torch.nn import functional as F
 from torch.utils.data import DataLoader, TensorDataset
 
 from utils.inc_net import SimpleVitNet
-from backbone.linears import CosineLinear, SimpleLinear
+from backbone.linears import CosineLinear
 from models.base import BaseLearner
 from utils.toolkit import tensor2numpy
 
@@ -45,22 +45,26 @@ class Learner(BaseLearner):
         # extra_param_count fixes for total_params).
         self._latest_head_trainable_params = 0
 
-        # Router: a plain growing linear classifier over a FIXED random
+        # Router: a growing CosineLinear classifier over a FIXED random
         # projection of frozen (pre-tosca) ViT features -- same random-
         # feature expansion the old ridge router used (RanPAC-style: makes
         # classes more linearly separable), but the classifier on top is now
         # gradient-trained, not a closed-form solve. It grows by one block
-        # of `inc` rows per task -- each block is a small SimpleLinear
+        # of `inc` rows per task -- each block is a small CosineLinear
         # trained ONLY during its own task (see _train), then detached and
-        # frozen into _router_weight_blocks/_router_bias_blocks forever
+        # frozen into _router_weight_blocks/_router_sigma_blocks forever
         # after. Because each block is a SEPARATE tensor concatenated at
         # scoring time (not one shared growing nn.Parameter), earlier blocks
         # are structurally immune to gradient updates from later tasks -- no
         # cross-task interference to guard against, unlike a single shared
-        # fc kept trainable across all tasks.
+        # fc kept trainable across all tasks. Cosine (not plain linear)
+        # specifically because independently-trained blocks have no shared
+        # constraint on output scale otherwise -- a plain linear router
+        # collapsed almost all routing to whichever block had the largest
+        # weight norm, confirmed empirically before this was cosine-scored.
         self._router_P = None  # [feat_dim, M] fixed random projection
         self._router_weight_blocks = []  # [inc, M] per task
-        self._router_bias_blocks = []  # [inc] per task
+        self._router_sigma_blocks = []  # scalar per task
 
     def incremental_train(self, data_manager):
         self._setup_task_loaders(data_manager)
@@ -115,22 +119,41 @@ class Learner(BaseLearner):
         start = self._task_ranges[self._cur_task][0]
         head = CosineLinear(self._network.feature_dim, inc).to(self._device)
 
-        # Router block for this task ONLY -- a plain linear layer over the
-        # FIXED random-projected expansion of frozen (pre-tosca) ViT
-        # features (see _router_features), trained on local labels just
-        # like the head. Frozen and appended to _router_weight_blocks/
-        # _router_bias_blocks after this loop (see after the epoch loop);
-        # previous blocks are never touched here since they're not part of
-        # this module at all.
-        router_new = SimpleLinear(
+        # Router block for this task ONLY -- a CosineLinear (not a plain
+        # linear layer) over the FIXED random-projected expansion of frozen
+        # (pre-tosca) ViT features (see _router_features), trained on local
+        # labels just like the head. CosineLinear specifically because each
+        # task's block is trained completely independently (its own local
+        # softmax, never sees other tasks' classes) -- a plain linear layer
+        # has no constraint tying its output SCALE to any other block's, so
+        # whichever block ends up with the largest weight norm silently
+        # dominates every joint argmax at routing time regardless of the
+        # input (verified empirically: one block's score stayed frozen
+        # across 6 straight evals while every other block scored exactly
+        # zero). Cosine similarity bounds every block's output to [-1, 1]
+        # regardless of weight norm, keeping independently-trained blocks
+        # comparable -- the same reason this already works for the expert
+        # heads. Frozen and appended to _router_weight_blocks/
+        # _router_sigma_blocks after this loop; previous blocks are never
+        # touched here since they're not part of this module at all.
+        router_new = CosineLinear(
             int(self.args.get("ridge_proj_dim", 5000)), inc
         ).to(self._device)
 
         optimizer = self.get_optimizer(
-            lr=self.args["lr"],
-            extra_params=list(head.parameters()) + list(router_new.parameters()),
+            lr=self.args["lr"], extra_params=head.parameters()
+        )
+        # Fully separate optimizer for the router, so its backward/step is
+        # entirely decoupled from the adapter+head's -- eliminates any
+        # possibility of the router's loss (an independently, from-scratch
+        # trained CosineLinear on a 15000-dim input) interfering with
+        # adapter/head training, which empirically collapsed when the two
+        # were combined into one shared loss.backward() call.
+        router_optimizer = self.get_optimizer(
+            lr=self.args["lr"], extra_params=router_new.parameters()
         )
         scheduler = self.get_scheduler(optimizer, self.args["epochs"])
+        router_scheduler = self.get_scheduler(router_optimizer, self.args["epochs"])
 
         backbone_train_start = time.perf_counter()
         prog_bar = tqdm(range(self.args["epochs"]))
@@ -152,10 +175,7 @@ class Learner(BaseLearner):
                 vit_feats = backbone.forward_features(inputs)
                 tosca_feats = backbone.forward_tosca(vit_feats)
                 logits = head(tosca_feats)["logits"]
-                router_logits = router_new(self._router_features(vit_feats))["logits"]
-                loss = F.cross_entropy(logits, local_targets) + F.cross_entropy(
-                    router_logits, local_targets
-                )
+                loss = F.cross_entropy(logits, local_targets)
                 l1_loss = sum(
                     p.abs().sum() for p in self._network.backbone.tosca.parameters()
                 )
@@ -163,7 +183,15 @@ class Learner(BaseLearner):
                 loss.backward()
                 optimizer.step()
 
-                losses += loss.item()
+                router_optimizer.zero_grad()
+                router_logits = router_new(
+                    self._router_features(vit_feats.detach())
+                )["logits"]
+                router_loss = F.cross_entropy(router_logits, local_targets)
+                router_loss.backward()
+                router_optimizer.step()
+
+                losses += loss.item() + router_loss.item()
                 _, preds = torch.max(logits, dim=1)
                 correct += preds.eq(local_targets.expand_as(preds)).cpu().sum()
                 _, router_preds = torch.max(router_logits, dim=1)
@@ -174,6 +202,8 @@ class Learner(BaseLearner):
 
             if scheduler is not None:
                 scheduler.step()
+            if router_scheduler is not None:
+                router_scheduler.step()
             train_acc = np.around(tensor2numpy(correct) * 100 / total, decimals=2)
             router_acc = np.around(
                 tensor2numpy(router_correct) * 100 / total, decimals=2
@@ -242,18 +272,18 @@ class Learner(BaseLearner):
 
     # ---------------------------------------------------------------- router
     def _save_router_block(self, router_new):
-        """Freeze this task's router block (weight+bias) and append it to
-        _router_weight_blocks/_router_bias_blocks -- it's never touched
+        """Freeze this task's router block (weight+sigma) and append it to
+        _router_weight_blocks/_router_sigma_blocks -- it's never touched
         again after this point, so earlier tasks' routing decisions can't
         drift as later tasks train. Also persisted to disk for offline
         reproducibility, mirroring _save_expert_head."""
         t = self._cur_task
         weight = router_new.weight.detach().clone()
-        bias = router_new.bias.detach().clone()
+        sigma = router_new.sigma.detach().clone()
         self._router_weight_blocks.append(weight)
-        self._router_bias_blocks.append(bias)
+        self._router_sigma_blocks.append(sigma)
         torch.save(
-            {"weight": weight.cpu(), "bias": bias.cpu()},
+            {"weight": weight.cpu(), "sigma": sigma.cpu()},
             os.path.join(self._ckpt_dir(), f"router_task{t}.pth"),
         )
         logging.info("Router block saved for task %s.", t)
@@ -280,18 +310,26 @@ class Learner(BaseLearner):
 
     def _router_logits(self, vit_features):
         """Score the random-projected expansion of frozen ViT features
-        against every router block trained so far, concatenated into one
-        joint linear classifier over all classes seen. Each block was
-        trained independently (see _train), so this is a plain
-        concatenation, not a joint re-fit."""
-        weight = torch.cat(self._router_weight_blocks, dim=0)
-        bias = torch.cat(self._router_bias_blocks, dim=0)
-        return F.linear(self._router_features(vit_features), weight, bias)
+        against every router block trained so far. Each block scores its
+        own classes via cosine similarity (normalized input/weight) scaled
+        by that block's OWN sigma, THEN the per-block scores are
+        concatenated -- this per-block cosine scoring is what keeps
+        independently-trained blocks comparable at the joint argmax (see
+        __init__); concatenating raw per-block logits before any
+        normalization would reintroduce the scale-domination problem."""
+        feats = F.normalize(self._router_features(vit_features), p=2, dim=1)
+        scores = [
+            sigma * F.linear(feats, F.normalize(weight, p=2, dim=1))
+            for weight, sigma in zip(
+                self._router_weight_blocks, self._router_sigma_blocks
+            )
+        ]
+        return torch.cat(scores, dim=1)
 
     def extra_param_count(self):
         """Element count of the classifier weights that live outside
         self._network (the router's fixed random projection P, every router
-        block's weight+bias, plus every per-task expert head's params), so
+        block's weight+sigma, plus every per-task expert head's params), so
         count_parameters(self._network) can be corrected to reflect the
         model's true total size. All are standalone tensors/modules created
         outside self._network, so count_parameters(self._network) can't
@@ -301,7 +339,7 @@ class Learner(BaseLearner):
         if self._router_P is not None:
             extra += self._router_P.numel()
         extra += sum(w.numel() for w in self._router_weight_blocks)
-        extra += sum(b.numel() for b in self._router_bias_blocks)
+        extra += sum(s.numel() for s in self._router_sigma_blocks)
         extra += self._expert_param_total
         return extra
 
