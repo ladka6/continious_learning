@@ -10,7 +10,7 @@ from torch.nn import functional as F
 from torch.utils.data import DataLoader, TensorDataset
 
 from utils.inc_net import SimpleVitNet
-from backbone.linears import CosineLinear
+from backbone.linears import CosineLinear, SimpleLinear
 from models.base import BaseLearner
 from utils.toolkit import tensor2numpy
 
@@ -32,7 +32,7 @@ class Learner(BaseLearner):
         # idx -> saved expert-head state dict (files are immutable once written).
         self._expert_head_cache = {}
         # Running element count of every saved per-task expert head's
-        # parameters, for ridge_extra_param_count() -- these heads are
+        # parameters, for extra_param_count() -- these heads are
         # standalone CosineLinear modules, never registered inside
         # self._network, so count_parameters(self._network) can't see them.
         self._expert_param_total = 0
@@ -42,43 +42,25 @@ class Learner(BaseLearner):
         # correct the "trainable_params" metric it logs right after this
         # task, since the head is a standalone module count_parameters(
         # model._network, True) can't see (same visibility gap as
-        # ridge_extra_param_count fixes for total_params).
+        # extra_param_count fixes for total_params).
         self._latest_head_trainable_params = 0
 
-        # Ridge classifiers (RanPAC-style decorrelation). Shared random
-        # projection P + Gram/class-sum accumulators, held IN MEMORY for the
-        # whole run so any previously routed task can still be scored.
-        # Inference (ridge_scope "global_router"): the global ridge on the
-        # frozen features routes top-1 to a task, then that task's
-        # TOSCA-expert classifier classifies within the task. The expert
-        # classifier is a small CosineLinear trained from scratch every task
-        # on just that task's own classes (local labels) -- not a shared,
-        # ever-growing fc, and not a second ridge system. Because it's never
-        # touched again after its own task's training loop, there's no
-        # cross-task interference to guard against; it's saved to disk once
-        # (see _save_expert_head) and reloaded at inference by whichever
-        # task the global router routes to.
-        self._ridge_scope = str(self.args.get("ridge_scope", "global_router"))
-        if (
-            not self.args.get("use_ridge", False)
-            or self._ridge_scope != "global_router"
-        ):
-            raise ValueError(
-                "Config must set use_ridge=true with ridge_scope 'global_router' "
-                f"(got use_ridge={self.args.get('use_ridge')}, "
-                f"ridge_scope={self._ridge_scope!r})."
-            )
-        # G/C are only ever needed in-memory for the current process (the
-        # live run keeps every task's G/C around so any previously routed
-        # task can still be scored). Disk persistence saves just the SOLVED
-        # W (a few KB) for reproducibility/inspection -- not the raw G/C
-        # (a dense [M, M] Gram matrix, ~900MB at M=15000 PER TASK; a 20-task
-        # dataset x 5 seeds at raw G/C would need ~100GB).
-        self._ridge_P = None  # [feat_dim, M] fixed random projection
-        self._ridge_W_cache = {}  # ("__global__", lambda) -> [M, total_classes]
-        # Global-scope running accumulators (shared frozen-feature space).
-        self._ridge_G_global = None  # [M, M]
-        self._ridge_C_global = None  # [M, total_classes]
+        # Router: a plain growing linear classifier over a FIXED random
+        # projection of frozen (pre-tosca) ViT features -- same random-
+        # feature expansion the old ridge router used (RanPAC-style: makes
+        # classes more linearly separable), but the classifier on top is now
+        # gradient-trained, not a closed-form solve. It grows by one block
+        # of `inc` rows per task -- each block is a small SimpleLinear
+        # trained ONLY during its own task (see _train), then detached and
+        # frozen into _router_weight_blocks/_router_bias_blocks forever
+        # after. Because each block is a SEPARATE tensor concatenated at
+        # scoring time (not one shared growing nn.Parameter), earlier blocks
+        # are structurally immune to gradient updates from later tasks -- no
+        # cross-task interference to guard against, unlike a single shared
+        # fc kept trainable across all tasks.
+        self._router_P = None  # [feat_dim, M] fixed random projection
+        self._router_weight_blocks = []  # [inc, M] per task
+        self._router_bias_blocks = []  # [inc] per task
 
     def incremental_train(self, data_manager):
         self._setup_task_loaders(data_manager)
@@ -88,7 +70,7 @@ class Learner(BaseLearner):
         """Bookkeeping + dataloaders for the current task, split out from
         incremental_train so an offline script can replay task boundaries
         (task_ranges, test_loader) without running gradient training -- it
-        loads saved adapters/expert heads/ridge state instead."""
+        loads saved adapters/expert heads/router blocks instead."""
         self._cur_task += 1
         self._total_classes = self._known_classes + data_manager.get_task_size(
             self._cur_task
@@ -120,18 +102,6 @@ class Learner(BaseLearner):
             test_dataset, batch_size=48, shuffle=False, num_workers=num_workers
         )
 
-        train_dataset_for_protonet = data_manager.get_dataset(
-            np.arange(self._known_classes, self._total_classes),
-            source="train",
-            mode="test",
-        )
-        self.train_loader_for_protonet = DataLoader(
-            train_dataset_for_protonet,
-            batch_size=self.args["batch_size"],
-            shuffle=True,
-            num_workers=num_workers,
-        )
-
     def _train(self):
         task_train_start = time.perf_counter()
         self._network.to(self._device)
@@ -145,8 +115,20 @@ class Learner(BaseLearner):
         start = self._task_ranges[self._cur_task][0]
         head = CosineLinear(self._network.feature_dim, inc).to(self._device)
 
+        # Router block for this task ONLY -- a plain linear layer over the
+        # FIXED random-projected expansion of frozen (pre-tosca) ViT
+        # features (see _router_features), trained on local labels just
+        # like the head. Frozen and appended to _router_weight_blocks/
+        # _router_bias_blocks after this loop (see after the epoch loop);
+        # previous blocks are never touched here since they're not part of
+        # this module at all.
+        router_new = SimpleLinear(
+            int(self.args.get("ridge_proj_dim", 5000)), inc
+        ).to(self._device)
+
         optimizer = self.get_optimizer(
-            lr=self.args["lr"], extra_params=head.parameters()
+            lr=self.args["lr"],
+            extra_params=list(head.parameters()) + list(router_new.parameters()),
         )
         scheduler = self.get_scheduler(optimizer, self.args["epochs"])
 
@@ -155,8 +137,9 @@ class Learner(BaseLearner):
         for _, epoch in enumerate(prog_bar):
             self._network.train()
             head.train()
+            router_new.train()
             losses = 0.0
-            correct, total = 0, 0
+            correct, router_correct, total = 0, 0, 0
             for _, inputs, targets in self.train_loader:
                 inputs, targets = (
                     inputs.to(self._device),
@@ -165,9 +148,14 @@ class Learner(BaseLearner):
                 local_targets = targets - start
 
                 optimizer.zero_grad()
-                feats = self._get_backbone()(inputs)
-                logits = head(feats)["logits"]
-                loss = F.cross_entropy(logits, local_targets)
+                backbone = self._get_backbone()
+                vit_feats = backbone.forward_features(inputs)
+                tosca_feats = backbone.forward_tosca(vit_feats)
+                logits = head(tosca_feats)["logits"]
+                router_logits = router_new(self._router_features(vit_feats))["logits"]
+                loss = F.cross_entropy(logits, local_targets) + F.cross_entropy(
+                    router_logits, local_targets
+                )
                 l1_loss = sum(
                     p.abs().sum() for p in self._network.backbone.tosca.parameters()
                 )
@@ -178,18 +166,26 @@ class Learner(BaseLearner):
                 losses += loss.item()
                 _, preds = torch.max(logits, dim=1)
                 correct += preds.eq(local_targets.expand_as(preds)).cpu().sum()
+                _, router_preds = torch.max(router_logits, dim=1)
+                router_correct += (
+                    router_preds.eq(local_targets.expand_as(router_preds)).cpu().sum()
+                )
                 total += len(targets)
 
             if scheduler is not None:
                 scheduler.step()
             train_acc = np.around(tensor2numpy(correct) * 100 / total, decimals=2)
+            router_acc = np.around(
+                tensor2numpy(router_correct) * 100 / total, decimals=2
+            )
 
-            info = "Task {}, Epoch {}/{} => Loss {:.3f}, Train_accy {:.2f}".format(
+            info = "Task {}, Epoch {}/{} => Loss {:.3f}, Train_accy {:.2f}, Router_accy {:.2f}".format(
                 self._cur_task,
                 epoch + 1,
                 self.args["epochs"],
                 losses / len(self.train_loader),
                 train_acc,
+                router_acc,
             )
             prog_bar.set_description(info)
 
@@ -197,25 +193,21 @@ class Learner(BaseLearner):
         backbone_train_seconds = time.perf_counter() - backbone_train_start
         self._save_tosca()
         self._save_expert_head(head)
+        self._save_router_block(router_new)
         if self._cur_task == 0:
             self._save_adaptmlp()
 
-        replace_fc_start = time.perf_counter()
-        self.replace_fc()
-        self._save_ridge_state()
-        replace_fc_seconds = time.perf_counter() - replace_fc_start
         task_train_seconds = time.perf_counter() - task_train_start
 
         self._latest_task_timing = {
             "backbone_train_seconds": backbone_train_seconds,
-            "replace_fc_seconds": replace_fc_seconds,
+            "replace_fc_seconds": 0.0,
             "task_train_seconds": task_train_seconds,
         }
         logging.info(
-            "Task {} timing => backbone_train {:.2f}s, replace_fc {:.2f}s, total_train {:.2f}s".format(
+            "Task {} timing => backbone_train {:.2f}s, total_train {:.2f}s".format(
                 self._cur_task,
                 backbone_train_seconds,
-                replace_fc_seconds,
                 task_train_seconds,
             )
         )
@@ -248,41 +240,68 @@ class Learner(BaseLearner):
         start, end = self._task_ranges[0]
         return end - start
 
-    # ------------------------------------------------------------------ ridge
-    def _ridge_projection(self, feature_dim):
-        """Fixed shared random projection [feat_dim -> M] (RanPAC-style lift).
-        Created once, seeded for reproducibility."""
-        if self._ridge_P is None:
+    # ---------------------------------------------------------------- router
+    def _save_router_block(self, router_new):
+        """Freeze this task's router block (weight+bias) and append it to
+        _router_weight_blocks/_router_bias_blocks -- it's never touched
+        again after this point, so earlier tasks' routing decisions can't
+        drift as later tasks train. Also persisted to disk for offline
+        reproducibility, mirroring _save_expert_head."""
+        t = self._cur_task
+        weight = router_new.weight.detach().clone()
+        bias = router_new.bias.detach().clone()
+        self._router_weight_blocks.append(weight)
+        self._router_bias_blocks.append(bias)
+        torch.save(
+            {"weight": weight.cpu(), "bias": bias.cpu()},
+            os.path.join(self._ckpt_dir(), f"router_task{t}.pth"),
+        )
+        logging.info("Router block saved for task %s.", t)
+
+    def _router_projection(self, feature_dim):
+        """Fixed shared random projection [feat_dim -> M] (RanPAC-style
+        lift) feeding the router's linear classifier. Created once, seeded
+        for reproducibility."""
+        if self._router_P is None:
             M = int(self.args.get("ridge_proj_dim", 5000))
             gen = torch.Generator(device="cpu").manual_seed(1993)
             P = torch.randn(feature_dim, M, generator=gen)
-            self._ridge_P = P.to(self._device)
-        return self._ridge_P
+            self._router_P = P.to(self._device)
+        return self._router_P
 
-    def _ridge_features(self, feats):
+    def _router_features(self, feats):
         """L2-normalize (optional), project, ReLU -> [N, M]."""
         if bool(self.args.get("ridge_normalize", True)):
             feats = F.normalize(feats, p=2, dim=1)
-        phi = feats @ self._ridge_projection(feats.size(1))
+        phi = feats @ self._router_projection(feats.size(1))
         if str(self.args.get("ridge_activation", "relu")) == "relu":
             phi = F.relu(phi)
         return phi
 
-    def ridge_extra_param_count(self):
+    def _router_logits(self, vit_features):
+        """Score the random-projected expansion of frozen ViT features
+        against every router block trained so far, concatenated into one
+        joint linear classifier over all classes seen. Each block was
+        trained independently (see _train), so this is a plain
+        concatenation, not a joint re-fit."""
+        weight = torch.cat(self._router_weight_blocks, dim=0)
+        bias = torch.cat(self._router_bias_blocks, dim=0)
+        return F.linear(self._router_features(vit_features), weight, bias)
+
+    def extra_param_count(self):
         """Element count of the classifier weights that live outside
-        self._network (the global router's random projection P and solved
-        head, plus every per-task expert head's params), so
+        self._network (the router's fixed random projection P, every router
+        block's weight+bias, plus every per-task expert head's params), so
         count_parameters(self._network) can be corrected to reflect the
-        model's true total size. Each expert head is a standalone
-        CosineLinear created fresh in _train and never registered as a
-        submodule of self._network, so count_parameters(self._network)
-        can't see it.
+        model's true total size. All are standalone tensors/modules created
+        outside self._network, so count_parameters(self._network) can't
+        see them.
         """
         extra = 0
-        if self._ridge_P is not None:
-            extra += self._ridge_P.numel()
-        if self._ridge_C_global is not None:
-            extra += self._ridge_C_global.numel()
+        if self._router_P is not None:
+            extra += self._router_P.numel()
+        extra += sum(w.numel() for w in self._router_weight_blocks)
+        extra += sum(b.numel() for b in self._router_bias_blocks)
         extra += self._expert_param_total
         return extra
 
@@ -301,8 +320,8 @@ class Learner(BaseLearner):
         training loop finishes, so unlike a single shared/growing fc there's
         no cross-task gradient interference to guard against; this is a
         plain save, not a rescue. Loaded back at inference via
-        _load_expert_head to classify within whichever task the global
-        ridge router routes to."""
+        _load_expert_head to classify within whichever task the router
+        routes to."""
         t = self._cur_task
         state = {"weight": head.weight.detach().cpu()}
         if getattr(head, "sigma", None) is not None:
@@ -327,9 +346,9 @@ class Learner(BaseLearner):
             self._expert_head_cache[idx] = state
         return state
 
-    def _routed_ridge_from_tasks(self, vit_features, topk_tasks, oracle_tasks=None):
+    def _score_routed_experts(self, vit_features, topk_tasks, oracle_tasks=None):
         """Given shared ViT features and a per-sample set of candidate tasks
-        [B, k] (from the global-ridge router), score each routed expert with
+        [B, k] (from the router), score each routed expert with
         its own independently-trained CosineLinear head (see _train,
         _save_expert_head) and scatter to the global class union. Scores are
         cosine similarities scaled by that task's own sigma, so they remain
@@ -371,7 +390,7 @@ class Learner(BaseLearner):
 
     def _task_scores_from_logits(self, logits):
         """Class logits [B, C] -> per-task score [B, num_tasks] (max class in
-        each task's block). Used to route from the global ridge's own output."""
+        each task's block). Used to route from the router's own output."""
         device = logits.device
         scores = torch.full(
             (logits.size(0), len(self._task_ranges)), float("-inf"), device=device
@@ -380,85 +399,23 @@ class Learner(BaseLearner):
             scores[:, t] = logits[:, start:end].max(dim=1).values
         return scores
 
-    def _get_global_routed_ridge_logits(self, inputs, oracle_tasks=None, lam=None):
-        """global_router: the GLOBAL ridge routes, then the per-task TOSCA
-        expert -- a gradient-trained linear (cosine) classifier head --
-        classifies within the chosen task. Top-1 routing -- validated best
-        over k=1/2/5 (larger k only injects impostor experts)."""
-        if lam is None:
-            lam = float(self.args.get("ridge_lambda", 1e4))
+    def _get_routed_logits(self, inputs, oracle_tasks=None):
+        """The router (growing linear classifier over frozen ViT features,
+        see _router_logits) routes top-1, then the per-task TOSCA expert --
+        a gradient-trained linear (cosine) classifier head -- classifies
+        within the chosen task. Top-1 routing -- validated best over
+        k=1/2/5 (larger k only injects impostor experts) back when this was
+        ridge-based; assumed to still hold, not re-validated for the linear
+        router."""
         vit_features = self._extract_backbone_features(inputs)
-        global_logits = self._ridge_features(vit_features) @ self._global_ridge_weight(
-            lam
-        )
+        global_logits = self._router_logits(vit_features)
         task_scores = self._task_scores_from_logits(global_logits)
         top1_task = task_scores.argmax(dim=1, keepdim=True)  # [B, 1]
-        return self._routed_ridge_from_tasks(vit_features, top1_task, oracle_tasks)
-
-    def _accumulate_global_ridge(self, frozen, labels):
-        """RanPAC-style single classifier: accumulate one shared Gram
-        G = Phi^T Phi and class-sum C = Phi^T Y over ALL classes, in the frozen
-        (pre-tosca) feature space. Decorrelates across tasks. Grows C's
-        columns as new classes arrive."""
-        total = self._total_classes
-        frozen = frozen.to(self._device)
-        labels = labels.to(self._device).long()
-        phi = self._ridge_features(frozen)  # [N, M]
-        onehot = torch.zeros(phi.size(0), total, device=self._device)
-        onehot[torch.arange(phi.size(0), device=self._device), labels] = 1.0
-        G = (phi.t() @ phi).float()
-        C = (phi.t() @ onehot).float()
-        if self._ridge_G_global is None:
-            self._ridge_G_global = G
-            self._ridge_C_global = C
-        else:
-            self._ridge_G_global = self._ridge_G_global + G
-            prev = self._ridge_C_global
-            grown = torch.zeros(prev.size(0), total, device=self._device)
-            grown[:, : prev.size(1)] = prev
-            self._ridge_C_global = grown + C
-        self._ridge_W_cache.clear()
-        logging.info(
-            "Global ridge accumulated Task %s: M=%d, N=%d, classes=%d.",
-            self._cur_task,
-            phi.size(1),
-            phi.size(0),
-            total,
-        )
-
-    def _global_ridge_weight(self, lam):
-        key = ("__global__", float(lam))
-        W = self._ridge_W_cache.get(key)
-        if W is None:
-            G = self._ridge_G_global.double()
-            C = self._ridge_C_global.double()
-            eye = torch.eye(G.size(0), device=G.device, dtype=G.dtype)
-            W = torch.linalg.solve(G + float(lam) * eye, C).float()
-            self._ridge_W_cache[key] = W
-        return W
+        return self._score_routed_experts(vit_features, top1_task, oracle_tasks)
 
     def after_task(self):
         self._network.backbone.reset_tosca()
         self._known_classes = self._total_classes
-
-    def replace_fc(self):
-        """Fit the global router ridge from the frozen (pre-tosca) features
-        of this task's own data -- exemplar-free, only Gram/class-sum stored,
-        never raw samples. The per-task expert classifier needs no separate
-        fit here: it's a standalone CosineLinear already trained by gradient
-        descent in _train and snapshotted per task by _save_expert_head."""
-        self._network.eval()
-        frozen_list = []
-        label_list = []
-        with torch.no_grad():
-            for _, data, label in self.train_loader_for_protonet:
-                data = data.to(self._device)
-                label = label.long().to(self._device)
-                vit = self._extract_backbone_features(data)
-                frozen_list.append(vit.cpu())
-                label_list.append(label.cpu())
-        label_list = torch.cat(label_list, dim=0)
-        self._accumulate_global_ridge(torch.cat(frozen_list, dim=0), label_list)
 
     def get_optimizer(self, lr, extra_params=None):
         params = list(filter(lambda p: p.requires_grad, self._network.parameters()))
@@ -510,9 +467,10 @@ class Learner(BaseLearner):
     def _compute_routing_flops(self, batch_size=1):
         num_tasks = max(self._cur_task + 1, 1)
 
-        # Global ridge as router/classifier: normalize + random projection
-        # (768->M) + ReLU + linear head to all seen classes. (In global_router
-        # the per-task expert cost is separate.)
+        # Router: normalize + random projection (768->M) + ReLU + linear
+        # head to all seen classes -- classifier is gradient-trained now,
+        # but the feature expansion is unchanged. (The per-task expert cost
+        # is separate.)
         feat_dim = int(self._network.feature_dim)
         M = int(self.args.get("ridge_proj_dim", 5000))
         classes = int(self._total_classes)
@@ -555,7 +513,7 @@ class Learner(BaseLearner):
             inputs, targets = inputs.to(self._device), targets.long().to(self._device)
             with torch.no_grad():
                 oracle_tasks = self._true_task_from_targets(targets) if oracle else None
-                outputs = self._get_global_routed_ridge_logits(
+                outputs = self._get_routed_logits(
                     inputs, oracle_tasks=oracle_tasks
                 )
             predicts = torch.topk(
@@ -567,12 +525,12 @@ class Learner(BaseLearner):
         return np.concatenate(y_pred), np.concatenate(y_true)
 
     def _ckpt_dir(self):
-        """Namespace all persisted checkpoints (tosca/adaptmlp/ridge) by
-        dataset + prefix + seed so concurrent or sequential runs -- different
-        datasets, hyperparameter grid variants, or the 5-seed benchmark runs
-        of the SAME dataset -- never read/write each other's files. Without
-        the seed tag, seed 1994 would silently overwrite seed 1993's saved
-        adapters/ridge matrices, breaking offline sweeps and resumes."""
+        """Namespace all persisted checkpoints (tosca/adaptmlp/router/head)
+        by dataset + prefix + seed so concurrent or sequential runs --
+        different datasets, hyperparameter grid variants, or the 5-seed
+        benchmark runs of the SAME dataset -- never read/write each other's
+        files. Without the seed tag, seed 1994 would silently overwrite seed
+        1993's saved adapters/blocks, breaking offline sweeps and resumes."""
         dataset = str(self.args.get("dataset", "data"))
         prefix = re.sub(
             r"[^A-Za-z0-9_.-]+", "_", str(self.args.get("prefix", "")).strip()
@@ -605,24 +563,6 @@ class Learner(BaseLearner):
         current_state_dict = self._network.state_dict()
         current_state_dict.update(state)
         self._network.load_state_dict(current_state_dict)
-
-    def _save_ridge_state(self):
-        """Persist the SOLVED global ridge weight W (not the raw G/C Gram
-        matrix) for reproducibility/inspection -- a few KB total, vs. G being
-        a dense [M, M] matrix (~900MB at M=15000). The snapshot uses a single
-        fixed filename since only the latest one is ever needed once training
-        has moved past a task. The per-task expert classifier (a standalone
-        CosineLinear) is saved separately by _save_expert_head, right after
-        training, before replace_fc runs."""
-        t = self._cur_task
-        ckpt_dir = self._ckpt_dir()
-        lam = float(self.args.get("ridge_lambda", 1e4))
-        if self._ridge_G_global is not None:
-            torch.save(
-                {"W": self._global_ridge_weight(lam).cpu(), "lambda": lam},
-                os.path.join(ckpt_dir, "ridge_global.pth"),
-            )
-        logging.info("Global ridge state saved for task %s.", t)
 
     def _save_tosca(self):
         path = os.path.join(self._ckpt_dir(), f"task{self._cur_task}.pth")
