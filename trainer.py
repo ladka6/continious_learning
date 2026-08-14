@@ -120,7 +120,7 @@ def _train(args):
             inference_flops_per_sample=infer_flops,
             total_params=(
                 count_parameters(model._network)
-                + getattr(model, "extra_param_count", lambda: 0)()
+                + getattr(model, "ridge_extra_param_count", lambda: 0)()
             ),
             trainable_params=(
                 count_parameters(model._network, True)
