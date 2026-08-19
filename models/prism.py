@@ -1,3 +1,9 @@
+"""Prism: global ridge router (random projections) + per-task TOSCA-adapted
+CosineLinear expert heads. "TOSCA" below refers specifically to the paper's
+adapter block (backbone/vit_tosca.py) that Prism uses internally -- the
+router, decoupled per-task heads, and their combination are Prism's own
+contribution, not the original TOSCA paper's architecture."""
+
 import logging
 import os
 import re
@@ -567,12 +573,13 @@ class Learner(BaseLearner):
         return np.concatenate(y_pred), np.concatenate(y_true)
 
     def _ckpt_dir(self):
-        """Namespace all persisted checkpoints (tosca/adaptmlp/ridge) by
-        dataset + prefix + seed so concurrent or sequential runs -- different
-        datasets, hyperparameter grid variants, or the 5-seed benchmark runs
-        of the SAME dataset -- never read/write each other's files. Without
-        the seed tag, seed 1994 would silently overwrite seed 1993's saved
-        adapters/ridge matrices, breaking offline sweeps and resumes."""
+        """Namespace all of Prism's persisted checkpoints (tosca adapter /
+        adaptmlp / ridge) by dataset + prefix + seed so concurrent or
+        sequential runs -- different datasets, hyperparameter grid variants,
+        or the 5-seed benchmark runs of the SAME dataset -- never read/write
+        each other's files. Without the seed tag, seed 1994 would silently
+        overwrite seed 1993's saved adapters/ridge matrices, breaking offline
+        sweeps and resumes."""
         dataset = str(self.args.get("dataset", "data"))
         prefix = re.sub(
             r"[^A-Za-z0-9_.-]+", "_", str(self.args.get("prefix", "")).strip()
@@ -581,7 +588,7 @@ class Learner(BaseLearner):
         seed = self.args.get("seed")
         if isinstance(seed, (int, np.integer)):
             tag = f"{tag}__seed{int(seed)}"
-        path = os.path.join("tosca", tag)
+        path = os.path.join("prism", tag)
         os.makedirs(path, exist_ok=True)
         return path
 

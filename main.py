@@ -21,7 +21,7 @@ def load_json(setting_path):
 
 def setup_parser():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--config', type=str, default='./exps/tosca_ina_ridge_router.json',
+    parser.add_argument('--config', type=str, default='./exps/prism_ina_ridge_router.json',
                         help='Json file of settings.')
     parser.add_argument('--seed', type=int, default=None,
                         help='Run only this seed (overrides the config seed list).')

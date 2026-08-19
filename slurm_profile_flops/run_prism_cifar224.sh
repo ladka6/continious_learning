@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=tosca-flops-cifar224
+#SBATCH --job-name=prism-flops-cifar224
 #SBATCH --partition=gpu_a100
 #SBATCH --gpus=1
 #SBATCH --cpus-per-task=8
@@ -13,4 +13,4 @@ set -euo pipefail
 cd "$HOME/continious_learning"
 source .venv/bin/activate
 
-python main.py --config exps/profile_flops/tosca_cifar224.json --seed 1993
+python main.py --config exps/profile_flops/prism_cifar224.json --seed 1993

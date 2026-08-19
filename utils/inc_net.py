@@ -8,7 +8,7 @@ def get_backbone(args, pretrained=False):
     name = args["backbone_type"].lower()
     type = args["model_name"].lower()
     
-    if type == "tosca" and name.endswith("_adapter"):
+    if type in ("prism", "tosca") and name.endswith("_adapter"):
         ffn_num = args["ffn_num"]
         from backbone import vit_adapter
         from easydict import EasyDict
@@ -46,7 +46,7 @@ def get_backbone(args, pretrained=False):
     
     elif name == "pretrained_vit_b16_224" or name == "vit_base_patch16_224":
         model = timm.create_model("vit_base_patch16_224",pretrained=True, num_classes=0)
-        if args["model_name"]=="tosca":
+        if args["model_name"].lower() in ("prism", "tosca"):
             from backbone import vit_tosca
             model= vit_tosca.ToscaViT(model, args["mlp_ratio"], args["se_ratio"], args["flow"])
         model.out_dim = 768
@@ -54,7 +54,7 @@ def get_backbone(args, pretrained=False):
     
     elif name == "pretrained_vit_b16_224_in21k" or name == "vit_base_patch16_224_in21k":
         model = timm.create_model("vit_base_patch16_224_in21k",pretrained=True, num_classes=0)
-        if args["model_name"]=="tosca":
+        if args["model_name"].lower() in ("prism", "tosca"):
             from backbone import vit_tosca
             model= vit_tosca.ToscaViT(model, args["mlp_ratio"], args["se_ratio"], args["flow"])
         model.out_dim = 768

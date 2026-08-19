@@ -28,7 +28,7 @@ global-router heads), since they're stored as plain attributes on the
 Learner rather than inside self._network's nn.Parameters -- unlike RanPAC,
 whose equivalent solved ridge weight lives inside self._network.fc.weight
 and IS counted by count_parameters(). trainer.py now adds
-model.ridge_extra_param_count() (models/tosca.py) on top of
+model.ridge_extra_param_count() (models/prism.py) on top of
 count_parameters(model._network) for total_params, computed from the
 persisted per-task/global _ridge_C accumulators (not the lazily-populated
 _ridge_W_cache, which may not cover every seen task). Only affects
@@ -51,6 +51,15 @@ import os
 from collections import defaultdict
 
 import numpy as np
+
+# The model was renamed tosca -> prism (the ridge-router + per-task
+# TOSCA-adapted heads system is Prism's own contribution; "tosca" only names
+# the adapter it uses internally, see models/prism.py). Runs logged before
+# the rename still have model_name="tosca" in their meta -- normalize so old
+# and new logs bucket together instead of splitting into two silent rows.
+def _normalize_model_name(name):
+    return "prism" if name == "tosca" else name
+
 
 # Methods whose gradient-based training only happens on task 0; later tasks
 # are closed-form (ridge/prototype), not `epochs`-many forward+backward
@@ -107,7 +116,7 @@ def load_profiled_flops(roots):
             meta, tasks = run.get("meta", {}), run.get("tasks", [])
             if not tasks:
                 continue
-            key = (str(meta.get("model_name")), str(meta.get("dataset")))
+            key = (_normalize_model_name(str(meta.get("model_name"))), str(meta.get("dataset")))
             profiled[key] = tasks
     return profiled
 
@@ -133,7 +142,7 @@ def load_runs(roots):
             meta, tasks = run.get("meta", {}), run.get("tasks", [])
             if not tasks:
                 continue
-            key = (str(meta.get("model_name")), str(meta.get("dataset")))
+            key = (_normalize_model_name(str(meta.get("model_name"))), str(meta.get("dataset")))
             seed = meta.get("seed")
             prev = runs[key].get(seed)
             # Keep the run that got furthest (re-runs / partial crashes).
@@ -144,7 +153,7 @@ def load_runs(roots):
 
 def per_seed_summary(run, profiled_tasks=None):
     meta, tasks = run["meta"], run["tasks"]
-    model_name = str(meta.get("model_name"))
+    model_name = _normalize_model_name(str(meta.get("model_name")))
     curve = [t.get("cnn_top1") for t in tasks if t.get("cnn_top1") is not None]
     epochs = meta.get("epochs") or EPOCHS_OVERRIDE.get(model_name) or 0
 

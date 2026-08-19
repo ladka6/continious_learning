@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=tosca-cub-ridge-router
+#SBATCH --job-name=prism-cub-ridge-router
 #SBATCH --partition=gpu_a100
 #SBATCH --gpus=1
 #SBATCH --cpus-per-task=8
@@ -16,4 +16,4 @@ source .venv/bin/activate
 
 # One seed per array job (1993..1997); a crashed seed never takes the others down.
 SEED=$((1993 + SLURM_ARRAY_TASK_ID))
-python main.py --config exps/tosca_cub_ridge_router.json --seed "$SEED"
+python main.py --config exps/prism_cub_ridge_router.json --seed "$SEED"

@@ -45,7 +45,7 @@ METHODS = [
     ("aper_adapter", "APER-Adapter"),
     ("ease", "EASE"),
     ("mos", "MOS"),
-    ("tosca", "TOSCA (ours)"),
+    ("prism", "Prism (ours)"),
 ]
 
 

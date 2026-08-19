@@ -5,7 +5,7 @@
   "memory_size": 0,
   "init_cls": 10,
   "increment": 10,
-  "model_name": "tosca",
+  "model_name": "prism",
   "backbone_type": "pretrained_vit_b16_224_in21k_adapter",
   "pretrained": true,
   "device": [
