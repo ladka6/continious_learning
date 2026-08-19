@@ -139,6 +139,12 @@ class Learner(BaseLearner):
         )
 
     def _train(self):
+        if bool(self.args.get("use_shared_head", False)):
+            self._train_shared_head()
+        else:
+            self._train_independent_heads()
+
+    def _train_independent_heads(self):
         task_train_start = time.perf_counter()
         self._network.to(self._device)
         self._set_trainable()
@@ -226,6 +232,126 @@ class Learner(BaseLearner):
             )
         )
 
+    def _train_shared_head(self):
+        """use_shared_head experiment: ONE growing CosineLinear
+        (self._network.fc) instead of Prism's usual per-task independent
+        heads -- mirrors the original TOSCA paper's classifier. update_fc
+        grows fc to total_classes, preserving already-learned rows and
+        zero-initializing this task's new ones (utils/inc_net.py). Trained
+        jointly with the TOSCA adapter via cross-entropy over ALL classes
+        seen so far (global labels, not remapped to this task's local
+        range), so -- like the original -- gradients touch older tasks'
+        rows too; there is deliberately no independent-heads-style isolation
+        here. Afterwards this task's own newly-added rows are overwritten
+        with class-mean prototypes (_refresh_shared_head_prototypes),
+        exactly like the original's replace_fc. The ridge router is
+        unchanged: it still picks which task's TOSCA to load at inference,
+        and only that task's own fc slice is trusted (see
+        _routed_ridge_from_tasks) -- only the classifier head's internals
+        match the original now, not the routing architecture around it."""
+        task_train_start = time.perf_counter()
+        self._network.to(self._device)
+        self._network.update_fc(self._total_classes)
+        self._set_trainable()
+
+        optimizer = self.get_optimizer(lr=self.args["lr"])
+        scheduler = self.get_scheduler(optimizer, self.args["epochs"])
+
+        backbone_train_start = time.perf_counter()
+        prog_bar = tqdm(range(self.args["epochs"]))
+        for _, epoch in enumerate(prog_bar):
+            self._network.train()
+            losses = 0.0
+            correct, total = 0, 0
+            for _, inputs, targets in self.train_loader:
+                inputs, targets = (
+                    inputs.to(self._device),
+                    targets.long().to(self._device),
+                )
+
+                optimizer.zero_grad()
+                logits = self._network(inputs)["logits"]
+                loss = F.cross_entropy(logits, targets)
+                l1_loss = sum(
+                    p.abs().sum() for p in self._network.backbone.tosca.parameters()
+                )
+                loss = loss + self.args["l1"] * l1_loss
+                loss.backward()
+                optimizer.step()
+
+                losses += loss.item()
+                _, preds = torch.max(logits, dim=1)
+                correct += preds.eq(targets.expand_as(preds)).cpu().sum()
+                total += len(targets)
+
+            if scheduler is not None:
+                scheduler.step()
+            train_acc = np.around(tensor2numpy(correct) * 100 / total, decimals=2)
+
+            info = "Task {}, Epoch {}/{} => Loss {:.3f}, Train_accy {:.2f}".format(
+                self._cur_task,
+                epoch + 1,
+                self.args["epochs"],
+                losses / len(self.train_loader),
+                train_acc,
+            )
+            prog_bar.set_description(info)
+
+        logging.info(info)
+        backbone_train_seconds = time.perf_counter() - backbone_train_start
+        self._save_tosca()
+        if self._cur_task == 0:
+            self._save_adaptmlp()
+        self._refresh_shared_head_prototypes()
+
+        replace_fc_start = time.perf_counter()
+        self.replace_fc()
+        self._save_ridge_state()
+        replace_fc_seconds = time.perf_counter() - replace_fc_start
+        task_train_seconds = time.perf_counter() - task_train_start
+
+        self._latest_task_timing = {
+            "backbone_train_seconds": backbone_train_seconds,
+            "replace_fc_seconds": replace_fc_seconds,
+            "task_train_seconds": task_train_seconds,
+        }
+        logging.info(
+            "Task {} timing => backbone_train {:.2f}s, replace_fc {:.2f}s, total_train {:.2f}s".format(
+                self._cur_task,
+                backbone_train_seconds,
+                replace_fc_seconds,
+                task_train_seconds,
+            )
+        )
+
+    def _refresh_shared_head_prototypes(self):
+        """use_shared_head experiment only. Overwrites just this task's
+        newly-added fc rows with class-mean prototype embeddings computed
+        under this task's just-trained TOSCA -- mirrors the original's
+        replace_fc exactly, including reloading the just-saved TOSCA weights
+        from disk rather than trusting the in-memory copy (matches the
+        original's own redundant reload)."""
+        self._network.eval()
+        self._load_tosca(self._cur_task)
+        embedding_list = []
+        label_list = []
+        with torch.no_grad():
+            for _, data, label in self.train_loader_for_protonet:
+                data = data.to(self._device)
+                label = label.long().to(self._device)
+                embedding = self._network.backbone(data)
+                embedding_list.append(embedding.cpu())
+                label_list.append(label.cpu())
+        embedding_list = torch.cat(embedding_list, dim=0)
+        label_list = torch.cat(label_list, dim=0)
+
+        class_list = np.unique(self.train_dataset.labels)
+        for class_index in class_list:
+            data_index = (label_list == class_index).nonzero().squeeze(-1)
+            embedding = embedding_list[data_index]
+            proto = embedding.mean(0)
+            self._network.fc.weight.data[class_index] = proto.to(self._device)
+
     def _get_backbone(self):
         if isinstance(self._network, torch.nn.DataParallel):
             return self._network.module.backbone
@@ -235,7 +361,8 @@ class Learner(BaseLearner):
         # Tosca adapter trainable every task (reset per task, see
         # after_task). ViT's own adaptmlp trainable on task 0 only, frozen
         # afterwards. The per-task expert head is a standalone module (see
-        # _train), not part of self._network, so it needs no entry here.
+        # _train_independent_heads), not part of self._network, so it needs
+        # no entry here.
         for p in self._network.parameters():
             p.requires_grad = False
         backbone = self._get_backbone()
@@ -245,6 +372,15 @@ class Learner(BaseLearner):
             for name, p in backbone.vit.named_parameters():
                 if "adaptmlp" in name:
                     p.requires_grad = True
+        # use_shared_head experiment: fc IS a registered self._network
+        # submodule (unlike the per-task heads), so it needs explicitly
+        # unfreezing here too.
+        if (
+            bool(self.args.get("use_shared_head", False))
+            and self._network.fc is not None
+        ):
+            for p in self._network.fc.parameters():
+                p.requires_grad = True
 
     def _extract_backbone_features(self, inputs):
         backbone = self._get_backbone()
@@ -335,18 +471,22 @@ class Learner(BaseLearner):
 
     def _routed_ridge_from_tasks(self, vit_features, topk_tasks, oracle_tasks=None):
         """Given shared ViT features and a per-sample set of candidate tasks
-        [B, k] (from the global-ridge router), score each routed expert with
-        its own independently-trained CosineLinear head (see _train,
-        _save_expert_head) and scatter to the global class union. Scores are
-        cosine similarities scaled by that task's own sigma, so they remain
-        cross-expert comparable and the argmax over the union is still a
-        JOINT decision."""
+        [B, k] (from the global-ridge router), score each routed expert and
+        scatter to the global class union. Normally (independent heads) each
+        expert is its own independently-trained CosineLinear (see
+        _train_independent_heads, _save_expert_head); under the
+        use_shared_head experiment there is one growing self._network.fc
+        instead, and only the routed task's own class-slice of it is
+        trusted. Either way scores are cosine similarities scaled by sigma,
+        so they remain cross-expert comparable and the argmax over the
+        union is still a JOINT decision."""
         inc = self._classes_per_task()
         device = vit_features.device
         batch_size = vit_features.size(0)
         total_classes = self._total_classes
         starts = torch.tensor([s for s, _ in self._task_ranges], device=device)
         offsets = torch.arange(inc, device=device)
+        shared_head = bool(self.args.get("use_shared_head", False))
 
         out_logits = torch.full(
             (batch_size, total_classes), float("-inf"), device=device
@@ -356,14 +496,17 @@ class Learner(BaseLearner):
             row_ids = (topk_tasks == task_idx).any(dim=1).nonzero(as_tuple=True)[0]
             self._load_tosca(task_idx)
             feats = self._get_backbone().forward_tosca(vit_features[row_ids])
-            head = self._load_expert_head(task_idx)
-            weight = head["weight"].to(device)
-            scores = F.linear(
-                F.normalize(feats, p=2, dim=1), F.normalize(weight, p=2, dim=1)
-            )
-            if "sigma" in head:
-                scores = head["sigma"].to(device) * scores
             start = int(starts[task_idx].item())
+            if shared_head:
+                scores = self._network.fc(feats)["logits"][:, start : start + inc]
+            else:
+                head = self._load_expert_head(task_idx)
+                weight = head["weight"].to(device)
+                scores = F.linear(
+                    F.normalize(feats, p=2, dim=1), F.normalize(weight, p=2, dim=1)
+                )
+                if "sigma" in head:
+                    scores = head["sigma"].to(device) * scores
             out_logits[row_ids, start : start + inc] = scores
 
         if oracle_tasks is not None:
