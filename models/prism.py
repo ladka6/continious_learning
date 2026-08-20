@@ -50,6 +50,11 @@ class Learner(BaseLearner):
         # model._network, True) can't see (same visibility gap as
         # ridge_extra_param_count fixes for total_params).
         self._latest_head_trainable_params = 0
+        # Two-ridge variant (use_task_ridge): per-task closed-form class
+        # ridge classifiers. idx -> solved W_t [M, inc]; and a running
+        # element count for ridge_extra_param_count (stored, non-trainable).
+        self._task_ridge_cache = {}
+        self._task_ridge_param_total = 0
 
         # Ridge classifiers (RanPAC-style decorrelation). Shared random
         # projection P + Gram/class-sum accumulators, held IN MEMORY for the
@@ -154,17 +159,14 @@ class Learner(BaseLearner):
         # from scratch on this task's own inc classes (local labels), never
         # touched again after this loop. No shared/growing fc, so no
         # cross-task gradient interference to guard against later.
-        # head_use_ridge_features (opt-in, default off): classify in the
-        # same random-projected, ReLU-expanded M-dim space the router uses
-        # (_ridge_features) instead of raw tosca-adapted features -- makes
-        # classes more linearly separable with few samples/task, the same
-        # reason RanPAC-style random features help in low-data regimes.
-        # This is the "two-ridge" variant: the random projection is used
-        # both for routing and for the per-task class decision. Off by
-        # default so existing single-ridge configs are unaffected.
+        # Under the two-ridge variant (use_task_ridge) this head is used
+        # ONLY to give the LuCA adapter a differentiable training signal;
+        # the actual class decision at inference is made by a per-task
+        # closed-form ridge fit in replace_fc (_fit_task_ridge), not by
+        # this head.
         inc = self._classes_per_task()
         start = self._task_ranges[self._cur_task][0]
-        head = CosineLinear(self._head_input_dim(), inc).to(self._device)
+        head = CosineLinear(self._network.feature_dim, inc).to(self._device)
 
         optimizer = self.get_optimizer(
             lr=self.args["lr"], extra_params=head.parameters()
@@ -187,7 +189,7 @@ class Learner(BaseLearner):
 
                 optimizer.zero_grad()
                 feats = self._get_backbone()(inputs)
-                logits = head(self._head_features(feats))["logits"]
+                logits = head(feats)["logits"]
                 loss = F.cross_entropy(logits, local_targets)
                 l1_loss = sum(
                     p.abs().sum() for p in self._network.backbone.tosca.parameters()
@@ -419,23 +421,52 @@ class Learner(BaseLearner):
             phi = F.relu(phi)
         return phi
 
-    def _head_input_dim(self):
-        """Feature dim the per-task expert head classifies over -- the
-        random-projected M-dim ridge space if head_use_ridge_features is
-        set (the two-ridge variant), else raw tosca-adapted features
-        (self._network.feature_dim)."""
-        if bool(self.args.get("head_use_ridge_features", False)):
-            return int(self.args.get("ridge_proj_dim", 5000))
-        return self._network.feature_dim
+    def _fit_task_ridge(self, adapted, labels):
+        """Two-ridge variant (use_task_ridge): fit a per-task closed-form
+        ridge CLASS classifier on this task's LuCA-adapted features, in the
+        SAME random-projected M-dim space the global router uses. This is
+        the second ridge: the global router ridge picks the task, then this
+        per-task ridge picks the class within it. W_t = (Phi^T Phi + lam I)^-1
+        Phi^T Y_local, with Phi = ridge_features(adapted) and Y_local the
+        one-hot over this task's own inc classes. Stored, never gradient-
+        trained, so it adds to total params but not trainable params."""
+        lam = float(self.args.get("ridge_lambda", 1e4))
+        adapted = adapted.to(self._device)
+        start = self._task_ranges[self._cur_task][0]
+        inc = self._classes_per_task()
+        phi = self._ridge_features(adapted)  # [N, M], same projection P
+        local = labels.to(self._device).long() - start
+        onehot = torch.zeros(phi.size(0), inc, device=self._device)
+        onehot[torch.arange(phi.size(0), device=self._device), local] = 1.0
+        G = (phi.t() @ phi).double()
+        C = (phi.t() @ onehot).double()
+        eye = torch.eye(G.size(0), device=G.device, dtype=G.dtype)
+        W = torch.linalg.solve(G + lam * eye, C).float()  # [M, inc]
+        self._task_ridge_cache[self._cur_task] = W
+        self._task_ridge_param_total += W.numel()
+        self._save_task_ridge(W)
+        logging.info(
+            "Task-ridge class classifier fit for task %s: M=%d, N=%d, classes=%d.",
+            self._cur_task,
+            phi.size(1),
+            phi.size(0),
+            inc,
+        )
 
-    def _head_features(self, feats):
-        """Transform tosca-adapted features into whatever space the expert
-        head classifies over (see _head_input_dim). Used both at train time
-        (_train_independent_heads) and at eval-time scoring
-        (_routed_ridge_from_tasks) so the two stay consistent."""
-        if bool(self.args.get("head_use_ridge_features", False)):
-            return self._ridge_features(feats)
-        return feats
+    def _save_task_ridge(self, W):
+        path = os.path.join(self._ckpt_dir(), f"task_ridge{self._cur_task}.pth")
+        torch.save({"W": W.cpu()}, path)
+
+    def _load_task_ridge(self, idx):
+        W = self._task_ridge_cache.get(idx)
+        if W is None:
+            state = torch.load(
+                os.path.join(self._ckpt_dir(), f"task_ridge{idx}.pth"),
+                map_location=self._device,
+            )
+            W = state["W"]
+            self._task_ridge_cache[idx] = W
+        return W
 
     def ridge_extra_param_count(self):
         """Element count of the classifier weights that live outside
@@ -453,6 +484,10 @@ class Learner(BaseLearner):
         if self._ridge_C_global is not None:
             extra += self._ridge_C_global.numel()
         extra += self._expert_param_total
+        # Two-ridge variant: the per-task closed-form class ridges (W_t) are
+        # stored, non-trainable classifier weights -- count them in total
+        # params, not trainable params.
+        extra += self._task_ridge_param_total
         return extra
 
     def expert_head_trainable_param_count(self):
@@ -524,14 +559,18 @@ class Learner(BaseLearner):
             self._load_tosca(task_idx)
             feats = self._get_backbone().forward_tosca(vit_features[row_ids])
             start = int(starts[task_idx].item())
-            if shared_head:
+            if bool(self.args.get("use_task_ridge", False)):
+                # Two-ridge: class decision by the per-task closed-form ridge
+                # on LuCA-adapted features in the router's random-feature space.
+                W_task = self._load_task_ridge(task_idx).to(device)
+                scores = self._ridge_features(feats) @ W_task
+            elif shared_head:
                 scores = self._network.fc(feats)["logits"][:, start : start + inc]
             else:
-                head_feats = self._head_features(feats)
                 head = self._load_expert_head(task_idx)
                 weight = head["weight"].to(device)
                 scores = F.linear(
-                    F.normalize(head_feats, p=2, dim=1), F.normalize(weight, p=2, dim=1)
+                    F.normalize(feats, p=2, dim=1), F.normalize(weight, p=2, dim=1)
                 )
                 if "sigma" in head:
                     scores = head["sigma"].to(device) * scores
@@ -621,11 +660,17 @@ class Learner(BaseLearner):
     def replace_fc(self):
         """Fit the global router ridge from the frozen (pre-tosca) features
         of this task's own data -- exemplar-free, only Gram/class-sum stored,
-        never raw samples. The per-task expert classifier needs no separate
-        fit here: it's a standalone CosineLinear already trained by gradient
-        descent in _train and snapshotted per task by _save_expert_head."""
+        never raw samples. Under the two-ridge variant (use_task_ridge) also
+        fit the per-task closed-form CLASS ridge on the LuCA-adapted features
+        of the same data (_fit_task_ridge); the throwaway gradient head from
+        _train only shaped the adapter and is not used at inference. The
+        router ridge uses FROZEN features (task decision), the class ridge
+        uses LuCA-ADAPTED features (class decision), both through the same
+        random projection."""
+        use_task_ridge = bool(self.args.get("use_task_ridge", False))
         self._network.eval()
         frozen_list = []
+        adapted_list = []
         label_list = []
         with torch.no_grad():
             for _, data, label in self.train_loader_for_protonet:
@@ -633,9 +678,14 @@ class Learner(BaseLearner):
                 label = label.long().to(self._device)
                 vit = self._extract_backbone_features(data)
                 frozen_list.append(vit.cpu())
+                if use_task_ridge:
+                    adapted = self._get_backbone().forward_tosca(vit)
+                    adapted_list.append(adapted.cpu())
                 label_list.append(label.cpu())
         label_list = torch.cat(label_list, dim=0)
         self._accumulate_global_ridge(torch.cat(frozen_list, dim=0), label_list)
+        if use_task_ridge:
+            self._fit_task_ridge(torch.cat(adapted_list, dim=0), label_list)
 
     def get_optimizer(self, lr, extra_params=None):
         params = list(filter(lambda p: p.requires_grad, self._network.parameters()))

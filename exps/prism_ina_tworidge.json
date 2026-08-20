@@ -39,5 +39,5 @@
   "ridge_normalize": true,
   "ridge_activation": "relu",
   "ridge_scope": "global_router",
-  "head_use_ridge_features": true
+  "use_task_ridge": true
 }
