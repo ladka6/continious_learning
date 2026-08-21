@@ -142,7 +142,10 @@ def load_tosca_eval(root):
         lines = [l for l in text.splitlines() if "CNN top1 curve" in l]
         if not lines:
             continue
-        nums = [float(x) for x in re.findall(r"\d+\.\d+|\d+", lines[-1].split("curve:")[1])]
+        # strip 'np.float64' first: its literal '64' would otherwise be
+        # parsed as a spurious data point between every real value.
+        curve_str = lines[-1].split("curve:")[1].replace("np.float64", "")
+        nums = [float(x) for x in re.findall(r"\d+\.\d+|\d+", curve_str)]
         if not nums:
             continue
         by_job[ds][jobid][idx or "single"] = nums
