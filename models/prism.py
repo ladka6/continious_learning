@@ -438,10 +438,13 @@ class Learner(BaseLearner):
         local = labels.to(self._device).long() - start
         onehot = torch.zeros(phi.size(0), inc, device=self._device)
         onehot[torch.arange(phi.size(0), device=self._device), local] = 1.0
-        G = (phi.t() @ phi).double()
-        C = (phi.t() @ onehot).double()
-        eye = torch.eye(G.size(0), device=G.device, dtype=G.dtype)
-        W = torch.linalg.solve(G + lam * eye, C).float()  # [M, inc]
+        # float32 solve + in-place ridge regularization (see
+        # _global_ridge_weight); G is a fresh temporary here, so mutating its
+        # diagonal is safe and needs no clone.
+        G = phi.t() @ phi  # [M, M] float32
+        C = phi.t() @ onehot  # [M, inc] float32
+        G.diagonal().add_(lam)
+        W = torch.linalg.solve(G, C)  # [M, inc] float32
         self._task_ridge_cache[self._cur_task] = W
         self._task_ridge_param_total += W.numel()
         self._save_task_ridge(W)
@@ -646,10 +649,14 @@ class Learner(BaseLearner):
         key = ("__global__", float(lam))
         W = self._ridge_W_cache.get(key)
         if W is None:
-            G = self._ridge_G_global.double()
-            C = self._ridge_C_global.double()
-            eye = torch.eye(G.size(0), device=G.device, dtype=G.dtype)
-            W = torch.linalg.solve(G + float(lam) * eye, C).float()
+            # Solve in float32 (matching RanPAC's analytic solve, so the two
+            # random-feature methods are measured on the same dtype) and add
+            # the ridge term in place on a fresh copy of G, instead of
+            # materializing a dense [M, M] identity and an [M, M] sum -- both
+            # roughly halve the peak memory of this [M, M] system.
+            A = self._ridge_G_global.clone()
+            A.diagonal().add_(float(lam))
+            W = torch.linalg.solve(A, self._ridge_C_global)
             self._ridge_W_cache[key] = W
         return W
 
