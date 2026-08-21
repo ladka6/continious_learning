@@ -18,11 +18,22 @@ import argparse
 import glob
 import json
 import os
+import re
 from collections import defaultdict
 
 import numpy as np
 
 PROFILE_PREFIX = "profile"
+
+# tosca-eval .out filename token (tosca-eval-<token>-<jobid>...) -> dataset key
+TOSCA_EVAL_ALIASES = {
+    "cifar": "cifar224",
+    "cub": "cub",
+    "imagenetr": "imagenetr", "imagenet-r": "imagenetr", "inr": "imagenetr",
+    "imageneta": "imageneta", "imagenet-a": "imageneta", "ina": "imageneta",
+    "omnibenchmark": "omnibenchmark", "omni": "omnibenchmark",
+    "vtab": "vtab",
+}
 
 # dataset meta-name -> (figure title, init_cls, increment)
 DATASETS = {
@@ -101,6 +112,51 @@ def load(roots):
     return runs
 
 
+def load_tosca_eval(root):
+    """Parse real TOSCA curves from tosca-eval .out logs (no metrics.json).
+
+    Files are tosca-eval-<token>-<jobid>[_<seedidx>].out; each logs the full
+    'CNN top1 curve: [...]' (re-emitted every stage, so the LAST line is the
+    complete curve). Group by (dataset, jobid), keep the jobid with the most
+    seed files (the 5-seed array), and average those curves per stage.
+
+    -> {("tosca", dataset): {seedidx: curve}}
+    """
+    # dataset -> jobid -> {seedidx: curve}
+    by_job = defaultdict(lambda: defaultdict(dict))
+    unmatched = set()
+    for path in glob.glob(os.path.join(root, "**", "*.out"), recursive=True):
+        base = os.path.basename(path)
+        m = re.match(r"tosca-eval-(.+?)-(\d+)(?:_(\d+))?\.out$", base)
+        if not m:
+            continue
+        token, jobid, idx = m.group(1), m.group(2), m.group(3)
+        ds = TOSCA_EVAL_ALIASES.get(token.lower())
+        if ds is None:
+            unmatched.add(token)
+            continue
+        try:
+            text = open(path).read()
+        except OSError:
+            continue
+        lines = [l for l in text.splitlines() if "CNN top1 curve" in l]
+        if not lines:
+            continue
+        nums = [float(x) for x in re.findall(r"\d+\.\d+|\d+", lines[-1].split("curve:")[1])]
+        if not nums:
+            continue
+        by_job[ds][jobid][idx or "single"] = nums
+    if unmatched:
+        print(f"# tosca-eval: unmapped dataset tokens {sorted(unmatched)} "
+              f"-- add to TOSCA_EVAL_ALIASES")
+    out = {}
+    for ds, jobs in by_job.items():
+        # pick the job with the most seed files; tie -> most recent (max jobid)
+        jobid = max(jobs, key=lambda j: (len(jobs[j]), int(j)))
+        out[("tosca", ds)] = jobs[jobid]
+    return out
+
+
 def mean_curve(seed_curves):
     """Per-stage mean over seeds; stages present in >=1 seed."""
     if not seed_curves:
@@ -118,7 +174,14 @@ def main():
     ap.add_argument("--roots", nargs="+",
                     default=["logs", "../pilot_baselines/logs", "../tosca-eval/logs"])
     args = ap.parse_args()
-    runs = load(args.roots)
+    # metrics.json roots (PILOT baselines + PRISM); tosca-eval roots parsed
+    # separately from .out logs since that repo writes no metrics.json.
+    json_roots = [r for r in args.roots if "tosca-eval" not in r]
+    tosca_roots = [r for r in args.roots if "tosca-eval" in r]
+    runs = load(json_roots)
+    for r in tosca_roots:
+        for key, seed_curves in load_tosca_eval(r).items():
+            runs[key] = seed_curves
 
     for ds in DATASET_ORDER:
         title, init_cls, inc = DATASETS[ds]
