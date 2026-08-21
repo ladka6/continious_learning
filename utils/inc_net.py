@@ -13,8 +13,10 @@ def get_backbone(args, pretrained=False):
         from backbone import vit_adapter
         from easydict import EasyDict
         tuning_config = EasyDict(
-                    # AdaptFormer
-                    ffn_adapt=True,
+                    # AdaptFormer. ffn_adapt=False (ablation) builds a vanilla
+                    # frozen ViT: no AdaptMLP module is created, the block uses
+                    # the plain MLP path, and only LuCA + the router adapt.
+                    ffn_adapt=bool(args.get("ffn_adapt", True)),
                     ffn_option="parallel",
                     ffn_adapter_layernorm_option="none",
                     ffn_adapter_init_option="lora",

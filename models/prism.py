@@ -226,7 +226,7 @@ class Learner(BaseLearner):
         backbone_train_seconds = time.perf_counter() - backbone_train_start
         self._save_tosca()
         self._save_expert_head(head)
-        if self._cur_task == 0:
+        if self._cur_task == 0 and bool(self.args.get("ffn_adapt", True)):
             self._save_adaptmlp()
 
         replace_fc_start = time.perf_counter()
@@ -317,7 +317,7 @@ class Learner(BaseLearner):
         logging.info(info)
         backbone_train_seconds = time.perf_counter() - backbone_train_start
         self._save_tosca()
-        if self._cur_task == 0:
+        if self._cur_task == 0 and bool(self.args.get("ffn_adapt", True)):
             self._save_adaptmlp()
         self._refresh_shared_head_prototypes()
 
@@ -385,7 +385,9 @@ class Learner(BaseLearner):
         backbone = self._get_backbone()
         for p in backbone.tosca.parameters():
             p.requires_grad = True
-        if self._cur_task == 0:
+        # ffn_adapt=False (frozen-vanilla-ViT ablation) builds no adaptmlp
+        # params, so this loop is a no-op then; guard it anyway for clarity.
+        if self._cur_task == 0 and bool(self.args.get("ffn_adapt", True)):
             for name, p in backbone.vit.named_parameters():
                 if "adaptmlp" in name:
                     p.requires_grad = True
@@ -876,6 +878,17 @@ class Learner(BaseLearner):
             metrics["routing_acc"] = self._last_routing_acc
             logging.info(
                 "Routing accuracy (top-1 task): {:.3f}".format(self._last_routing_acc)
+            )
+        # Oracle ceiling: re-evaluate the SAME trained experts but route with
+        # ground-truth task ids, isolating accuracy lost purely to routing.
+        if bool(self.args.get("log_oracle", False)):
+            yo_pred, yo_true = self._eval_cnn(self.test_loader, oracle=True)
+            oracle_accy = self._evaluate(yo_pred, yo_true)
+            metrics["oracle_top1"] = oracle_accy["top1"]
+            logging.info(
+                "Oracle accuracy (ground-truth routing, top-1): {:.3f}".format(
+                    oracle_accy["top1"]
+                )
             )
         return cnn_accy, nme_accy, metrics
 

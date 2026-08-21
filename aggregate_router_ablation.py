@@ -26,6 +26,9 @@ VARIANTS = [
     ("gate_lin", "Learned linear gate (no ReLU)"),
     ("gate_linrelu", "Learned linear gate (ReLU proj)"),
     ("gate_mlp", "Learned MLP gate (ReLU proj)"),
+    # Group 3: ceiling / backbone controls (M=15000, ReLU ridge router)
+    ("oracle", "Oracle routing (ground-truth)"),
+    ("noadaptmlp", "Frozen ViT (no AdaptMLP) + LuCA"),
 ]
 
 
@@ -37,10 +40,13 @@ def _ms(x):
 
 
 def main():
-    print(f"{'Router variant':28} {'Route acc':>14} {'Final acc':>14} {'Avg inc':>14}")
-    print("-" * 74)
+    print(
+        f"{'Router variant':32} {'Route acc':>14} {'Final acc':>14} "
+        f"{'Avg inc':>14} {'Oracle acc':>14}"
+    )
+    print("-" * 92)
     for tag, label in VARIANTS:
-        racc, fin, avg = [], [], []
+        racc, fin, avg, orc = [], [], [], []
         for f in sorted(glob.glob(f"logs/prism-abl-{tag}-*_*.out")):
             text = open(f).read()
             curves = [l for l in text.splitlines() if "CNN top1 curve" in l]
@@ -55,9 +61,15 @@ def main():
             r = re.findall(r"Routing accuracy \(top-1 task\): ([\d.]+)", text)
             if r:
                 racc.append(float(r[-1]))
+            o = re.findall(
+                r"Oracle accuracy \(ground-truth routing, top-1\): ([\d.]+)", text
+            )
+            if o:
+                orc.append(float(o[-1]))
         n = len(fin)
         print(
-            f"{label:28} {_ms(racc):>14} {_ms(fin):>14} {_ms(avg):>14}   (n={n})"
+            f"{label:32} {_ms(racc):>14} {_ms(fin):>14} {_ms(avg):>14} "
+            f"{_ms(orc):>14}   (n={n})"
         )
 
 
