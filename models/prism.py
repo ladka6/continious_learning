@@ -11,7 +11,7 @@ import numpy as np
 import torch
 import time
 from tqdm import tqdm
-from torch import optim
+from torch import nn, optim
 from torch.nn import functional as F
 from torch.utils.data import DataLoader, TensorDataset
 
@@ -90,6 +90,12 @@ class Learner(BaseLearner):
         # Global-scope running accumulators (shared frozen-feature space).
         self._ridge_G_global = None  # [M, M]
         self._ridge_C_global = None  # [M, total_classes]
+        # Ablation only: learned task-gate router (router_type "linear"/"mlp").
+        # A grown-per-task classifier over the projected features, trained
+        # INCREMENTALLY on each task's own data -> so it forgets earlier
+        # tasks, unlike the closed-form ridge router. None for the default
+        # router_type "ridge".
+        self._gate = None
 
     def incremental_train(self, data_manager):
         self._setup_task_loaders(data_manager)
@@ -436,6 +442,75 @@ class Learner(BaseLearner):
             return feats
         return self._ridge_features(feats)
 
+    # ----------------------------------------------------- learned gate (ablation)
+    def _router_task_scores(self, vit_features, lam=None):
+        """Per-task routing scores [B, num_tasks] according to router_type:
+        'ridge' (default) uses the closed-form global ridge; 'linear'/'mlp'
+        use the incrementally-trained learned gate. Only the ROUTER changes;
+        the per-task class decision downstream is unaffected."""
+        phi = self._router_features(vit_features)
+        if str(self.args.get("router_type", "ridge")) == "ridge":
+            if lam is None:
+                lam = float(self.args.get("ridge_lambda", 1e4))
+            return self._task_scores_from_logits(phi @ self._global_ridge_weight(lam))
+        return self._gate(phi)  # [B, num_tasks]
+
+    def _ensure_gate(self, num_tasks):
+        """Create / grow the learned gate to num_tasks outputs, preserving
+        already-learned rows. 'linear' = one Linear(M, T); 'mlp' = Linear(M,
+        H)->ReLU->Linear(H, T)."""
+        rt = str(self.args.get("router_type", "ridge"))
+        M = int(self.args.get("ridge_proj_dim", 5000))
+        H = int(self.args.get("gate_hidden", 512))
+        dev = self._device
+        if self._gate is None:
+            if rt == "mlp":
+                self._gate = nn.Sequential(
+                    nn.Linear(M, H), nn.ReLU(), nn.Linear(H, num_tasks)
+                ).to(dev)
+            else:
+                self._gate = nn.Linear(M, num_tasks).to(dev)
+            return
+        head = self._gate[-1] if isinstance(self._gate, nn.Sequential) else self._gate
+        if head.out_features < num_tasks:
+            grown = nn.Linear(head.in_features, num_tasks).to(dev)
+            with torch.no_grad():
+                grown.weight[: head.out_features] = head.weight
+                grown.bias[: head.out_features] = head.bias
+            if isinstance(self._gate, nn.Sequential):
+                self._gate[-1] = grown
+            else:
+                self._gate = grown
+
+    def _train_task_gate(self, phi, task_idx):
+        """Incrementally train the learned gate on THIS task's projected
+        features only, all labeled task_idx -- exactly the CIL setting (no old
+        data), so the gate drifts toward the latest task and forgets earlier
+        ones. This is the point of the learned-gate baseline; the closed-form
+        ridge router avoids it by re-solving from accumulated statistics."""
+        self._ensure_gate(self._cur_task + 1)
+        dev = self._device
+        phi = phi.to(dev).float()
+        targets = torch.full((phi.size(0),), int(task_idx), dtype=torch.long, device=dev)
+        opt = optim.Adam(self._gate.parameters(), lr=float(self.args.get("gate_lr", 1e-3)))
+        loader = DataLoader(
+            TensorDataset(phi, targets), batch_size=256, shuffle=True
+        )
+        self._gate.train()
+        for _ in range(int(self.args.get("gate_epochs", 10))):
+            for xb, yb in loader:
+                opt.zero_grad()
+                F.cross_entropy(self._gate(xb), yb).backward()
+                opt.step()
+        self._gate.eval()
+        logging.info(
+            "Learned gate (%s) trained on task %s: M=%d, N=%d.",
+            self.args.get("router_type"),
+            task_idx,
+            phi.size(1),
+            phi.size(0),
+        )
+
     def _fit_task_ridge(self, adapted, labels):
         """Two-ridge variant (use_task_ridge): fit a per-task closed-form
         ridge CLASS classifier on this task's LuCA-adapted features, in the
@@ -622,10 +697,7 @@ class Learner(BaseLearner):
         if lam is None:
             lam = float(self.args.get("ridge_lambda", 1e4))
         vit_features = self._extract_backbone_features(inputs)
-        global_logits = self._router_features(vit_features) @ self._global_ridge_weight(
-            lam
-        )
-        task_scores = self._task_scores_from_logits(global_logits)
+        task_scores = self._router_task_scores(vit_features, lam)
         top1_task = task_scores.argmax(dim=1, keepdim=True)  # [B, 1]
         out_logits = self._routed_ridge_from_tasks(
             vit_features, top1_task, oracle_tasks
@@ -709,7 +781,15 @@ class Learner(BaseLearner):
                     adapted_list.append(adapted.cpu())
                 label_list.append(label.cpu())
         label_list = torch.cat(label_list, dim=0)
-        self._accumulate_global_ridge(torch.cat(frozen_list, dim=0), label_list)
+        frozen = torch.cat(frozen_list, dim=0)
+        if str(self.args.get("router_type", "ridge")) == "ridge":
+            self._accumulate_global_ridge(frozen, label_list)
+        else:
+            # Learned-gate router (ablation): train the gate on this task's
+            # projected features -> task index (incremental; forgets old tasks).
+            with torch.no_grad():
+                phi = self._router_features(frozen.to(self._device))
+            self._train_task_gate(phi, self._cur_task)
         if use_task_ridge:
             self._fit_task_ridge(torch.cat(adapted_list, dim=0), label_list)
 

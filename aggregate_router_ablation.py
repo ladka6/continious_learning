@@ -15,12 +15,17 @@ import re
 import numpy as np
 
 VARIANTS = [
+    # Group 1: routing space + M-sweep (closed-form ridge router)
     ("raw", "Raw [CLS] (no projection)"),
-    ("lin15k", "Proj linear, M=15000"),
-    ("relu1k", "Proj + ReLU, M=1000"),
-    ("relu5k", "Proj + ReLU, M=5000"),
-    ("relu15k", "Proj + ReLU, M=15000"),
-    ("relu25k", "Proj + ReLU, M=25000"),
+    ("lin15k", "Proj linear (no ReLU), M=15000"),
+    ("relu5k", "Proj + ReLU ridge, M=5000"),
+    ("relu10k", "Proj + ReLU ridge, M=10000 (RanPAC)"),
+    ("relu15k", "Proj + ReLU ridge, M=15000 (ours)"),
+    ("relu20k", "Proj + ReLU ridge, M=20000"),
+    # Group 2: learned gates (incremental), M=15000
+    ("gate_lin", "Learned linear gate (no ReLU)"),
+    ("gate_linrelu", "Learned linear gate (ReLU proj)"),
+    ("gate_mlp", "Learned MLP gate (ReLU proj)"),
 ]
 
 

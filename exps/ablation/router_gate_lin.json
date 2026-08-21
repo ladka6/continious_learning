@@ -1,5 +1,5 @@
 {
-  "prefix": "abl_lin15k",
+  "prefix": "abl_gate_lin",
   "dataset": "imageneta",
   "shuffle": true,
   "memory_size": 0,
@@ -42,5 +42,8 @@
   "use_task_ridge": false,
   "log_routing_acc": true,
   "router_space": "projected",
-  "router_type": "ridge"
+  "router_type": "linear",
+  "gate_epochs": 10,
+  "gate_lr": 0.001,
+  "gate_hidden": 512
 }

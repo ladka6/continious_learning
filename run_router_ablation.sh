@@ -3,8 +3,8 @@
 #SBATCH --gpus=1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=40G
-#SBATCH --time=03:00:00
-#SBATCH --array=0-2
+#SBATCH --time=01:00:00
+#SBATCH --array=0-4
 #SBATCH --output=logs/%x-%A_%a.out
 #SBATCH --error=logs/%x-%A_%a.err
 set -euo pipefail

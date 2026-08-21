@@ -1,5 +1,5 @@
 {
-  "prefix": "abl_lin15k",
+  "prefix": "abl_gate_mlp",
   "dataset": "imageneta",
   "shuffle": true,
   "memory_size": 0,
@@ -37,10 +37,13 @@
   "ridge_proj_dim": 15000,
   "ridge_lambda": 1000.0,
   "ridge_normalize": true,
-  "ridge_activation": "none",
+  "ridge_activation": "relu",
   "ridge_scope": "global_router",
   "use_task_ridge": false,
   "log_routing_acc": true,
   "router_space": "projected",
-  "router_type": "ridge"
+  "router_type": "mlp",
+  "gate_epochs": 10,
+  "gate_lr": 0.001,
+  "gate_hidden": 512
 }

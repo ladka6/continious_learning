@@ -41,5 +41,6 @@
   "ridge_scope": "global_router",
   "use_task_ridge": false,
   "log_routing_acc": true,
-  "router_space": "raw"
+  "router_space": "raw",
+  "router_type": "ridge"
 }

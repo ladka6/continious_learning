@@ -41,5 +41,6 @@
   "ridge_scope": "global_router",
   "use_task_ridge": false,
   "log_routing_acc": true,
-  "router_space": "projected"
+  "router_space": "projected",
+  "router_type": "ridge"
 }

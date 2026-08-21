@@ -1,5 +1,5 @@
 {
-  "prefix": "abl_relu25k",
+  "prefix": "abl_gate_linrelu",
   "dataset": "imageneta",
   "shuffle": true,
   "memory_size": 0,
@@ -34,12 +34,16 @@
     15
   ],
   "use_ridge": true,
-  "ridge_proj_dim": 25000,
+  "ridge_proj_dim": 15000,
   "ridge_lambda": 1000.0,
   "ridge_normalize": true,
   "ridge_activation": "relu",
   "ridge_scope": "global_router",
   "use_task_ridge": false,
   "log_routing_acc": true,
-  "router_space": "projected"
+  "router_space": "projected",
+  "router_type": "linear",
+  "gate_epochs": 10,
+  "gate_lr": 0.001,
+  "gate_hidden": 512
 }
