@@ -8,3 +8,9 @@
 *.out
 Screenshot*
 /paper*
+# model checkpoints / run outputs (never track -- they make git stash/status crawl)
+/prism
+/tosca
+/results
+*.pth
+all_datasets_results.txt
