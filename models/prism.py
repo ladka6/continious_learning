@@ -421,6 +421,21 @@ class Learner(BaseLearner):
             phi = F.relu(phi)
         return phi
 
+    def _router_features(self, feats):
+        """Feature space the GLOBAL ROUTER operates in. Ablation hook:
+        router_space='raw' routes directly on the (L2-normalized) frozen
+        [CLS] features with no projection; otherwise ('projected', default)
+        it uses the RanPAC-style random-feature lift (_ridge_features). Used
+        at both router fit (_accumulate_global_ridge) and router eval
+        (_get_global_routed_ridge_logits) so the two stay in the same space.
+        The per-task CLASS ridge/head is unaffected -- this only ablates the
+        routing space."""
+        if str(self.args.get("router_space", "projected")) == "raw":
+            if bool(self.args.get("ridge_normalize", True)):
+                feats = F.normalize(feats, p=2, dim=1)
+            return feats
+        return self._ridge_features(feats)
+
     def _fit_task_ridge(self, adapted, labels):
         """Two-ridge variant (use_task_ridge): fit a per-task closed-form
         ridge CLASS classifier on this task's LuCA-adapted features, in the
@@ -607,12 +622,15 @@ class Learner(BaseLearner):
         if lam is None:
             lam = float(self.args.get("ridge_lambda", 1e4))
         vit_features = self._extract_backbone_features(inputs)
-        global_logits = self._ridge_features(vit_features) @ self._global_ridge_weight(
+        global_logits = self._router_features(vit_features) @ self._global_ridge_weight(
             lam
         )
         task_scores = self._task_scores_from_logits(global_logits)
         top1_task = task_scores.argmax(dim=1, keepdim=True)  # [B, 1]
-        return self._routed_ridge_from_tasks(vit_features, top1_task, oracle_tasks)
+        out_logits = self._routed_ridge_from_tasks(
+            vit_features, top1_task, oracle_tasks
+        )
+        return out_logits, top1_task.squeeze(1)
 
     def _accumulate_global_ridge(self, frozen, labels):
         """RanPAC-style single classifier: accumulate one shared Gram
@@ -622,7 +640,7 @@ class Learner(BaseLearner):
         total = self._total_classes
         frozen = frozen.to(self._device)
         labels = labels.to(self._device).long()
-        phi = self._ridge_features(frozen)  # [N, M]
+        phi = self._router_features(frozen)  # [N, router-space dim]
         onehot = torch.zeros(phi.size(0), total, device=self._device)
         onehot[torch.arange(phi.size(0), device=self._device), labels] = 1.0
         G = (phi.t() @ phi).float()
@@ -773,6 +791,11 @@ class Learner(BaseLearner):
         metrics["eval_seconds"] = eval_seconds
         metrics["ms_per_sample"] = 1000.0 * eval_seconds / max(num_samples, 1)
         metrics["routing_flops"] = routing_flops
+        if getattr(self, "_last_routing_acc", None) is not None:
+            metrics["routing_acc"] = self._last_routing_acc
+            logging.info(
+                "Routing accuracy (top-1 task): {:.3f}".format(self._last_routing_acc)
+            )
         return cnn_accy, nme_accy, metrics
 
     def _true_task_from_targets(self, targets):
@@ -784,20 +807,29 @@ class Learner(BaseLearner):
     def _eval_cnn(self, loader, oracle=False):
         self._network.eval()
         y_pred, y_true = [], []
+        route_correct, route_total = 0, 0
+        log_routing = bool(self.args.get("log_routing_acc", False))
 
         for _, (_, inputs, targets) in enumerate(loader):
             inputs, targets = inputs.to(self._device), targets.long().to(self._device)
             with torch.no_grad():
                 oracle_tasks = self._true_task_from_targets(targets) if oracle else None
-                outputs = self._get_global_routed_ridge_logits(
+                outputs, top1_task = self._get_global_routed_ridge_logits(
                     inputs, oracle_tasks=oracle_tasks
                 )
+                if log_routing:
+                    true_task = self._true_task_from_targets(targets)
+                    route_correct += (top1_task == true_task).sum().item()
+                    route_total += targets.size(0)
             predicts = torch.topk(
                 outputs, k=self.topk, dim=1, largest=True, sorted=True
             )[1]
             y_pred.append(predicts.cpu().numpy())
             y_true.append(targets.cpu().numpy())
 
+        self._last_routing_acc = (
+            100.0 * route_correct / route_total if route_total else None
+        )
         return np.concatenate(y_pred), np.concatenate(y_true)
 
     def _ckpt_dir(self):

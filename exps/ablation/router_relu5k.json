@@ -1,0 +1,45 @@
+{
+  "prefix": "abl_relu5k",
+  "dataset": "imageneta",
+  "shuffle": true,
+  "memory_size": 0,
+  "init_cls": 20,
+  "increment": 20,
+  "model_name": "prism",
+  "backbone_type": "pretrained_vit_b16_224_in21k_adapter",
+  "pretrained": true,
+  "device": [
+    "0"
+  ],
+  "seed": [
+    1993,
+    1994,
+    1995,
+    1996,
+    1997
+  ],
+  "mlp_ratio": 16,
+  "se_ratio": 16,
+  "l1": 0.0005,
+  "flow": "tosca",
+  "ffn_num": 64,
+  "epochs": 20,
+  "batch_size": 48,
+  "optimizer": "sgd",
+  "scheduler": "cosine",
+  "lr": 0.05,
+  "weight_decay": 0,
+  "milestones": [
+    10,
+    15
+  ],
+  "use_ridge": true,
+  "ridge_proj_dim": 5000,
+  "ridge_lambda": 1000.0,
+  "ridge_normalize": true,
+  "ridge_activation": "relu",
+  "ridge_scope": "global_router",
+  "use_task_ridge": false,
+  "log_routing_acc": true,
+  "router_space": "projected"
+}
