@@ -626,7 +626,7 @@ class Learner(BaseLearner):
             self._expert_head_cache[idx] = state
         return state
 
-    def _routed_ridge_from_tasks(self, vit_features, topk_tasks, oracle_tasks=None):
+    def _routed_ridge_from_tasks(self, vit_features, topk_tasks):
         """Given shared ViT features and a per-sample set of candidate tasks
         [B, k] (from the global-ridge router), score each routed expert and
         scatter to the global class union. Normally (independent heads) each
@@ -642,7 +642,6 @@ class Learner(BaseLearner):
         batch_size = vit_features.size(0)
         total_classes = self._total_classes
         starts = torch.tensor([s for s, _ in self._task_ranges], device=device)
-        offsets = torch.arange(inc, device=device)
         shared_head = bool(self.args.get("use_shared_head", False))
 
         out_logits = torch.full(
@@ -671,13 +670,6 @@ class Learner(BaseLearner):
                     scores = head["sigma"].to(device) * scores
             out_logits[row_ids, start : start + inc] = scores
 
-        if oracle_tasks is not None:
-            oracle_tasks = oracle_tasks.to(device)
-            routed_true = (topk_tasks == oracle_tasks.unsqueeze(1)).any(dim=1)
-            block = starts[oracle_tasks].unsqueeze(1) + offsets.unsqueeze(0)
-            keep = torch.full((batch_size, total_classes), float("-inf"), device=device)
-            keep.scatter_(1, block, out_logits.gather(1, block))
-            out_logits = torch.where(routed_true.unsqueeze(1), keep, out_logits)
         return out_logits
 
     def _task_scores_from_logits(self, logits):
@@ -701,9 +693,14 @@ class Learner(BaseLearner):
         vit_features = self._extract_backbone_features(inputs)
         task_scores = self._router_task_scores(vit_features, lam)
         top1_task = task_scores.argmax(dim=1, keepdim=True)  # [B, 1]
-        out_logits = self._routed_ridge_from_tasks(
-            vit_features, top1_task, oracle_tasks
-        )
+        if oracle_tasks is not None:
+            # Routing ceiling: send every sample to its GROUND-TRUTH task
+            # expert, so the resulting accuracy isolates the experts' own
+            # within-task discrimination from the router's mistakes.
+            route_tasks = oracle_tasks.view(-1, 1)
+        else:
+            route_tasks = top1_task
+        out_logits = self._routed_ridge_from_tasks(vit_features, route_tasks)
         return out_logits, top1_task.squeeze(1)
 
     def _accumulate_global_ridge(self, frozen, labels):
