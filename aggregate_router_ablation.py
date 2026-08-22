@@ -46,8 +46,17 @@ def main():
     )
     print("-" * 92)
     for tag, label in VARIANTS:
+        # Keep only the most recent SLURM array (highest job id) per variant,
+        # so a bugfix rerun's logs are not averaged together with the stale
+        # ones it replaces (they share the prism-abl-<tag>-* prefix).
+        jobs = {}
+        for f in glob.glob(f"logs/prism-abl-{tag}-*_*.out"):
+            m = re.search(rf"prism-abl-{re.escape(tag)}-(\d+)_\d+\.out$", f)
+            if m:
+                jobs.setdefault(int(m.group(1)), []).append(f)
+        files = sorted(jobs[max(jobs)]) if jobs else []
         racc, fin, avg, orc = [], [], [], []
-        for f in sorted(glob.glob(f"logs/prism-abl-{tag}-*_*.out")):
+        for f in files:
             text = open(f).read()
             curves = [l for l in text.splitlines() if "CNN top1 curve" in l]
             if not curves:
