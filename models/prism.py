@@ -90,6 +90,15 @@ class Learner(BaseLearner):
         # Global-scope running accumulators (shared frozen-feature space).
         self._ridge_G_global = None  # [M, M]
         self._ridge_C_global = None  # [M, total_classes]
+        # router_label_space="task": literal Eq. 1-2 router -- a ridge fit
+        # directly on task-label one-hots (T columns, growing by one per new
+        # task) instead of RanPAC's class-label one-hots reduced to per-task
+        # scores afterward (router_label_space="class", the default and what
+        # ridge_scope="global_router" has always actually computed). G is
+        # shared with the class-ridge accumulator (routing features only,
+        # independent of which label target is used); only C and W differ.
+        self._ridge_C_task_global = None  # [M, num_tasks]
+        self._ridge_W_task_cache = {}  # ("__task__", lambda) -> [M, num_tasks]
         # Ablation only: learned task-gate router (router_type "linear"/"mlp").
         # A grown-per-task classifier over the projected features, trained
         # INCREMENTALLY on each task's own data -> so it forgets earlier
@@ -449,11 +458,20 @@ class Learner(BaseLearner):
         """Per-task routing scores [B, num_tasks] according to router_type:
         'ridge' (default) uses the closed-form global ridge; 'linear'/'mlp'
         use the incrementally-trained learned gate. Only the ROUTER changes;
-        the per-task class decision downstream is unaffected."""
+        the per-task class decision downstream is unaffected.
+
+        Under router_type='ridge', router_label_space selects what the ridge
+        is actually fit against: 'class' (default) fits RanPAC's own
+        class-label ridge and reduces class logits to per-task scores via
+        _task_scores_from_logits; 'task' fits a SEPARATE ridge directly on
+        task-label one-hots (the literal Eq. 1-2 router), whose output is
+        already [B, num_tasks] with no reduction step."""
         phi = self._router_features(vit_features)
         if str(self.args.get("router_type", "ridge")) == "ridge":
             if lam is None:
                 lam = float(self.args.get("ridge_lambda", 1e4))
+            if str(self.args.get("router_label_space", "class")) == "task":
+                return phi @ self._global_task_ridge_weight(lam)
             return self._task_scores_from_logits(phi @ self._global_ridge_weight(lam))
         return self._gate(phi)  # [B, num_tasks]
 
@@ -734,6 +752,46 @@ class Learner(BaseLearner):
             total,
         )
 
+    def _accumulate_global_task_ridge(self, frozen):
+        """router_label_space='task': accumulate the class-sum analogue for
+        a ridge fit directly on task-label one-hots, i.e. Eq. 1-2's Y^task,
+        rather than RanPAC's class-label one-hots. All rows passed in belong
+        to self._cur_task (this is only ever called from replace_fc on the
+        current task's own training data), so the one-hot is a single column
+        of ones at index self._cur_task -- no per-sample label lookup needed.
+        G is NOT recomputed here; it's shared with _accumulate_global_ridge
+        since it depends only on the routing features, not the label target."""
+        num_tasks = self._cur_task + 1
+        phi = self._router_features(frozen.to(self._device))  # [N, M]
+        onehot = torch.zeros(phi.size(0), num_tasks, device=self._device)
+        onehot[:, self._cur_task] = 1.0
+        C = (phi.t() @ onehot).float()
+        if self._ridge_C_task_global is None:
+            self._ridge_C_task_global = C
+        else:
+            prev = self._ridge_C_task_global
+            grown = torch.zeros(prev.size(0), num_tasks, device=self._device)
+            grown[:, : prev.size(1)] = prev
+            self._ridge_C_task_global = grown + C
+        self._ridge_W_task_cache.clear()
+        logging.info(
+            "Global task-label ridge accumulated Task %s: M=%d, N=%d, tasks=%d.",
+            self._cur_task,
+            phi.size(1),
+            phi.size(0),
+            num_tasks,
+        )
+
+    def _global_task_ridge_weight(self, lam):
+        key = ("__task__", float(lam))
+        W = self._ridge_W_task_cache.get(key)
+        if W is None:
+            A = self._ridge_G_global.double()
+            A.diagonal().add_(float(lam))
+            W = torch.linalg.solve(A, self._ridge_C_task_global.double()).float()
+            self._ridge_W_task_cache[key] = W
+        return W
+
     def _global_ridge_weight(self, lam):
         key = ("__global__", float(lam))
         W = self._ridge_W_cache.get(key)
@@ -783,6 +841,8 @@ class Learner(BaseLearner):
         frozen = torch.cat(frozen_list, dim=0)
         if str(self.args.get("router_type", "ridge")) == "ridge":
             self._accumulate_global_ridge(frozen, label_list)
+            if str(self.args.get("router_label_space", "class")) == "task":
+                self._accumulate_global_task_ridge(frozen)
         else:
             # Learned-gate router (ablation): train the gate on this task's
             # projected features -> task index (incremental; forgets old tasks).
