@@ -90,9 +90,18 @@ def main():
         (axes[0], "raw", "(a) Raw [CLS] features"),
         (axes[1], "proj", "(b) Projected + ReLU features"),
     ]:
-        X_train = data[f"train_{feat_key}_feats"]
+        X_train = data[f"train_{feat_key}_feats"].astype(np.float64)
         y_class_train = data["train_class_labels"]
-        X_test = data[f"test_{feat_key}_feats"]
+        X_test = data[f"test_{feat_key}_feats"].astype(np.float64)
+        if feat_key == "raw":
+            # _router_features(router_space="raw") L2-normalizes before
+            # returning -- the extraction script saved the backbone output
+            # BEFORE that normalization step (proj_feats already went
+            # through the full _router_features, which is why it matched
+            # almost exactly). Applying it here is equivalent, since
+            # normalization doesn't need the backbone re-run.
+            X_train = X_train / np.linalg.norm(X_train, axis=1, keepdims=True)
+            X_test = X_test / np.linalg.norm(X_test, axis=1, keepdims=True)
 
         task_scores, routing_acc = route_and_score(
             X_train, y_class_train, X_test, test_task, n_classes, classes_per_task,
@@ -104,7 +113,7 @@ def main():
             mask = test_task == t
             ax.scatter(emb[mask, 0], emb[mask, 1], s=6, alpha=0.7,
                        color=cmap(t % cmap.N), label=f"T{t+1}")
-        ax.set_title(f"{title}\nreplicated routing acc: {routing_acc:.1f}%", fontsize=10)
+        ax.set_title(f"{title}\nrouting acc: {routing_acc:.1f}%", fontsize=10)
         ax.set_xticks([])
         ax.set_yticks([])
 
