@@ -284,6 +284,24 @@ def per_seed_summary(run, profiled_runs=None):
                 train_flops_est += 3.0 * f * n * epochs
             else:
                 have_flops = False
+    # Trainable params source: prefer the newest profiling run's per-task
+    # values when available. Param counts are architecture-deterministic --
+    # identical across seeds and unaffected by a profiling run's reduced
+    # epoch count -- so a single fresh profiling run (which carries each
+    # model's _trained_param_count fix: what the optimizer actually
+    # updates, not the requires_grad census) corrects the whole 5-seed
+    # row without re-running 5 seeds of training. Under the two-point
+    # scheme the HIGHEST profiled epoch count is always the most recently
+    # generated run, so stale pre-fix profiles never win. Falls back to
+    # this run's own logged values when no usable profile exists.
+    trainable_src = tasks
+    if epoch_counts:
+        cand = profiled_runs[epoch_counts[-1]]
+        if len(cand) >= len(tasks) and any(
+            t.get("trainable_params") for t in cand
+        ):
+            trainable_src = cand[: len(tasks)]
+
     last = tasks[-1]
     return {
         "n_tasks": len(tasks),
@@ -306,7 +324,7 @@ def per_seed_summary(run, profiled_runs=None):
         # what training actually cost. Matches the paper caption's "peak
         # per-stage gradient-trained footprint".
         "trainable_params_m": max(
-            (t.get("trainable_params") or 0) for t in tasks
+            (t.get("trainable_params") or 0) for t in trainable_src
         ) / 1e6,
         "checkpoint_mb": last.get("checkpoint_mb"),
     }
