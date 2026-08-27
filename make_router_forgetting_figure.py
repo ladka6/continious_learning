@@ -39,7 +39,8 @@ def main():
         mean = np.array(data[key]["mean"])
         std = np.array(data[key]["std"])
         stages = np.arange(1, len(mean) + 1)
-        ax.plot(stages, mean, color=style["color"], label=style["label"], linewidth=2)
+        ax.plot(stages, mean, color=style["color"], label=style["label"], linewidth=2,
+                marker="o", markersize=5)
         ax.fill_between(stages, mean - std, mean + std, color=style["color"], alpha=0.2)
 
     n_tasks = max(len(data[k]["mean"]) for k in data)
