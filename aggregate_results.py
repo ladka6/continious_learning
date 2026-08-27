@@ -48,6 +48,7 @@ import csv
 import glob
 import json
 import os
+import re
 from collections import defaultdict
 
 import numpy as np
@@ -99,10 +100,20 @@ PROFILE_PREFIX = "profileflops_"
 
 
 def load_profiled_flops(roots):
-    """-> {(model, dataset): [task_dicts]} from dedicated profiling runs.
-    Used only to replace the analytic train_gflops_est with a measured
-    value where available; never contributes to accuracy numbers."""
+    """-> {(model, dataset): {profiled_epoch_count: [task_dicts]}} from
+    dedicated profiling runs. Used only to replace the analytic
+    train_gflops_est with a measured value where available; never
+    contributes to accuracy numbers.
+
+    TWO runs at DIFFERENT epoch counts (e.g. 1 and 2) enable the exact
+    fixed + epochs * per_epoch decomposition in per_seed_summary; a single
+    run falls back to the legacy epoch-ratio rescaling (with its known
+    overestimate of epoch-independent work). If two runs share an epoch
+    count -- e.g. a stale pre-rename profiling run sitting next to a fresh
+    one -- the most recently written file wins, so stale runs are shadowed
+    without needing manual deletion."""
     profiled = {}
+    mtimes = {}
     for root in roots:
         for path in glob.glob(os.path.join(root, "**", "*_metrics.json"), recursive=True):
             if not os.path.basename(path).startswith(PROFILE_PREFIX):
@@ -117,8 +128,28 @@ def load_profiled_flops(roots):
             if not tasks:
                 continue
             key = (_normalize_model_name(str(meta.get("model_name"))), str(meta.get("dataset")))
-            profiled[key] = tasks
+            pe = tasks[0].get("profiled_epochs")
+            mtime = os.path.getmtime(path)
+            if pe in profiled.get(key, {}) and mtimes[(key, pe)] >= mtime:
+                continue
+            profiled.setdefault(key, {})[pe] = tasks
+            mtimes[(key, pe)] = mtime
     return profiled
+
+
+# Canonical PRISM benchmark prefixes, in preference order. The logs mix
+# several experiments that ALL normalize to model_name "prism" and reach
+# the full task count: the paper's one-ridge runs (prefix "oneridge", plus
+# its cifar224 rerun "primaryopt"), two-ridge variants ("tworidge",
+# "tworidgeopt"), and pre-rename runs (prefix " "). Without an explicit
+# filter they collide in the same (model, dataset, seed) bucket and the
+# winner is whichever file glob() happens to return first -- i.e. the
+# paper's PRISM row silently becomes an arbitrary pick among different
+# experiments. Lower rank = preferred when both exist for the same seed.
+PRISM_PREFIX_RANK = {"primaryopt": 0, "oneridge": 1}
+
+# "{prefix}_{4-digit-seed}_{backbone}_metrics.json"
+_PREFIX_RE = re.compile(r"^(.*?)_(\d{4})_")
 
 
 def load_runs(roots):
@@ -143,21 +174,68 @@ def load_runs(roots):
             if not tasks:
                 continue
             key = (_normalize_model_name(str(meta.get("model_name"))), str(meta.get("dataset")))
+            m = _PREFIX_RE.match(basename)
+            prefix = m.group(1).strip() if m else ""
+            if key[0] == "prism" and prefix not in PRISM_PREFIX_RANK:
+                continue
+            rank = PRISM_PREFIX_RANK.get(prefix, 99)
             seed = meta.get("seed")
             prev = runs[key].get(seed)
-            # Keep the run that got furthest (re-runs / partial crashes).
-            if prev is None or len(tasks) > len(prev["tasks"]):
-                runs[key][seed] = {"meta": meta, "tasks": tasks, "path": path}
+            # Keep the run that got furthest (re-runs / partial crashes);
+            # on equal length, the preferred canonical prefix.
+            if (
+                prev is None
+                or len(tasks) > len(prev["tasks"])
+                or (len(tasks) == len(prev["tasks"]) and rank < prev["rank"])
+            ):
+                runs[key][seed] = {"meta": meta, "tasks": tasks, "path": path, "rank": rank}
     return runs
 
 
-def per_seed_summary(run, profiled_tasks=None):
+def per_seed_summary(run, profiled_runs=None):
     meta, tasks = run["meta"], run["tasks"]
     model_name = _normalize_model_name(str(meta.get("model_name")))
     curve = [t.get("cnn_top1") for t in tasks if t.get("cnn_top1") is not None]
     epochs = meta.get("epochs") or EPOCHS_OVERRIDE.get(model_name) or 0
 
-    if profiled_tasks and len(profiled_tasks) >= len(tasks):
+    profiled_runs = profiled_runs or {}
+    epoch_counts = sorted(e for e in profiled_runs if e)
+    twopoint = (
+        len(epoch_counts) >= 2
+        and all(len(profiled_runs[e]) >= len(tasks) for e in epoch_counts[:2])
+    )
+    profiled_tasks = (
+        profiled_runs[epoch_counts[0]]
+        if len(epoch_counts) == 1 or (epoch_counts and not twopoint)
+        else None
+    )
+
+    if twopoint and epochs:
+        # EXACT per-task decomposition from two profiling runs at different
+        # epoch counts: F(e) = fixed + e * per_epoch. FLOPs are
+        # deterministic in tensor shapes, so two points determine the line
+        # exactly. This fixes the legacy path's systematic error of
+        # rescaling a task's WHOLE measured cost by (epochs /
+        # profiled_epochs): the epoch-INDEPENDENT work inside
+        # incremental_train (replace_fc feature extraction, ridge/Gram
+        # accumulation, prototype computation) does not repeat per epoch
+        # and must not be multiplied by the real epoch count. It also
+        # subsumes the TRAIN_ONLY_TASK0 special case: a closed-form task
+        # measures identical FLOPs at both epoch counts, so per_epoch = 0
+        # and its true cost passes through unscaled.
+        ea, eb = epoch_counts[:2]
+        train_flops_est = 0.0
+        have_flops = True
+        for i in range(len(tasks)):
+            Fa = profiled_runs[ea][i].get("train_flops_measured")
+            Fb = profiled_runs[eb][i].get("train_flops_measured")
+            if Fa is None or Fb is None:
+                have_flops = False
+                continue
+            per_epoch = (Fb - Fa) / (eb - ea)
+            fixed = Fa - ea * per_epoch
+            train_flops_est += fixed + epochs * per_epoch
+    elif profiled_tasks and len(profiled_tasks) >= len(tasks):
         # Real torch.profiler-measured FLOPs available for this (model,
         # dataset) from a dedicated reduced-epoch profiling run. Scale each
         # task's measured FLOPs by (this run's real epoch count / the
@@ -220,7 +298,16 @@ def per_seed_summary(run, profiled_tasks=None):
         "train_peak_mem_mb": max((t.get("train_peak_mem_mb") or 0) for t in tasks),
         "eval_peak_mem_mb": max((t.get("eval_peak_mem_mb") or 0) for t in tasks),
         "total_params_m": (last.get("total_params") or 0) / 1e6,
-        "trainable_params_m": (last.get("trainable_params") or 0) / 1e6,
+        # PEAK gradient-trained footprint over the run, not the last task's
+        # snapshot: methods that adapt the backbone only in the first
+        # session (RanPAC, APER, Prism) hit their real trainable peak at
+        # task 0, and the last task's requires_grad state (tiny adapter, or
+        # a freshly rebuilt fc that never sees a gradient) misrepresents
+        # what training actually cost. Matches the paper caption's "peak
+        # per-stage gradient-trained footprint".
+        "trainable_params_m": max(
+            (t.get("trainable_params") or 0) for t in tasks
+        ) / 1e6,
         "checkpoint_mb": last.get("checkpoint_mb"),
     }
 
@@ -259,8 +346,8 @@ def aggregate(runs, profiled=None):
     profiled = profiled or {}
     rows = []
     for (model, dataset), by_seed in sorted(runs.items()):
-        profiled_tasks = profiled.get((model, dataset))
-        summaries = [per_seed_summary(r, profiled_tasks) for r in by_seed.values()]
+        profiled_runs = profiled.get((model, dataset))
+        summaries = [per_seed_summary(r, profiled_runs) for r in by_seed.values()]
         expected_tasks = EXPECTED_TASKS.get(dataset)
         if expected_tasks is None:
             expected_tasks = max(s["n_tasks"] for s in summaries)
