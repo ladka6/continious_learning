@@ -21,6 +21,14 @@ exactly) -- because a ridge classifier fit on only ~150 points/task in a
 real router benefits from when fit on the full accumulated training set.
 Using the training data directly closes that regime gap.
 
+Also dumps per-sample CLASS labels (0..total_classes-1), not just task
+labels, so a separate script can replicate the REAL router mechanism
+exactly -- a 200-way class-level ridge reduced to 10 task scores via
+per-task max-pooling (_accumulate_global_ridge + _task_scores_from_logits)
+-- instead of the weaker direct-task-classifier proxy every earlier probe
+in this investigation used, which is why those all underestimated the
+projected space's real advantage.
+
 This does NOT train anything: it replays the config's task boundaries via
 _setup_task_loaders (the offline-replay path _setup_task_loaders was split
 out for, see its docstring in prism.py) and loads the already-trained
@@ -77,7 +85,7 @@ def main():
     model._load_adaptmlp()
     model._network.eval()
 
-    raw_feats, proj_feats, task_labels = [], [], []
+    raw_feats, proj_feats, task_labels, class_labels = [], [], [], []
     with torch.no_grad():
         for _ in range(data_manager.nb_tasks):
             # _setup_task_loaders rebuilds train_loader_for_protonet for
@@ -93,6 +101,7 @@ def main():
                 raw_feats.append(feats.cpu())
                 proj_feats.append(proj.cpu().half())  # half precision: M=15000 is large
                 task_labels.append(torch.full((inputs.size(0),), cur_task, dtype=torch.long))
+                class_labels.append(targets.long())  # already GLOBAL class ids, 0..199
             # after_task() must still run each iteration -- _known_classes
             # only advances there, not in _setup_task_loaders, and the NEXT
             # iteration's task-boundary bookkeeping depends on it. Its
@@ -103,8 +112,9 @@ def main():
     raw_feats = torch.cat(raw_feats, dim=0).numpy()
     proj_feats = torch.cat(proj_feats, dim=0).numpy()
     task_labels = torch.cat(task_labels, dim=0).numpy()
+    class_labels = torch.cat(class_labels, dim=0).numpy()
 
-    # Subsample n_per_task per task for a readable, tractable UMAP plot.
+    # Subsample n_per_task per task for a readable, tractable plot.
     rng = np.random.default_rng(cli.seed)
     keep = []
     for t in np.unique(task_labels):
@@ -118,10 +128,14 @@ def main():
         raw_feats=raw_feats[keep],
         proj_feats=proj_feats[keep],
         task_labels=task_labels[keep],
+        class_labels=class_labels[keep],
+        total_classes=np.array([args["nb_classes"]]),
+        classes_per_task=np.array([args["increment"]]),
     )
     print(f"Wrote {cli.out}: {len(keep)} samples, "
           f"raw={raw_feats[keep].shape}, proj={proj_feats[keep].shape}, "
-          f"{len(np.unique(task_labels))} tasks")
+          f"{len(np.unique(task_labels))} tasks, "
+          f"{len(np.unique(class_labels))} classes")
 
 
 if __name__ == "__main__":
