@@ -62,8 +62,15 @@ def main():
     # Offline replay: walk every task boundary without training, so
     # _task_ranges/_known_classes/_total_classes end up exactly as they were
     # after the real training run finished, then reload its AdaptMLP.
+    # after_task() must run each iteration too -- _known_classes only
+    # advances there, not in _setup_task_loaders, so skipping it would leave
+    # _known_classes stuck at 0 and every task_ranges entry identically
+    # (0, task_size) instead of the real cumulative boundaries. reset_tosca()
+    # inside after_task() is harmless here since this script never touches
+    # TOSCA-adapted features, only the frozen backbone.
     for _ in range(data_manager.nb_tasks):
         model._setup_task_loaders(data_manager)
+        model.after_task()
     model._load_adaptmlp()
     model._network.eval()
 
