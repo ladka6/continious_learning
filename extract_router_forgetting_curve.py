@@ -65,8 +65,12 @@ def main():
                      help="exps/ablation/router_<tag>.json prefix suffix for the ridge router")
     ap.add_argument("--gate-tag", default="gate_linrelu",
                      help="exps/ablation/router_<tag>.json prefix suffix for the learned gate")
+    ap.add_argument("--json-out", default=None,
+                     help="Also write {ridge,gate: {mean:[...], std:[...]}} here, "
+                          "for make_router_forgetting_figure.py to plot locally.")
     args = ap.parse_args()
 
+    json_payload = {}
     for tag, label in [(args.ridge_tag, "ridge"), (args.gate_tag, "gate")]:
         curves = per_stage_curves(tag)
         n = len(curves)
@@ -84,6 +88,13 @@ def main():
         print(f"\\addplot+[name path={label}_upper, draw=none] coordinates {{{coords_upper}}};  % {label} +1 std")
         print(f"\\addplot+[name path={label}_lower, draw=none] coordinates {{{coords_lower}}};  % {label} -1 std")
         print(f"\\addplot[fill=gray!20] fill between[of={label}_upper and {label}_lower];  % {label} shaded band")
+        json_payload[label] = {"mean": means, "std": stds, "n_seeds": n}
+
+    if args.json_out:
+        import json
+        with open(args.json_out, "w") as f:
+            json.dump(json_payload, f, indent=2)
+        print(f"\nWrote {args.json_out}")
 
 
 if __name__ == "__main__":
