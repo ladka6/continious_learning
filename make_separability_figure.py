@@ -34,6 +34,18 @@ def main():
     ap.add_argument("--in", dest="inp", default="separability_features.npz")
     ap.add_argument("--out", default="paper/figs/fig_umap_mock.pdf")
     ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument("--target-weight", type=float, default=0.0,
+                     help="UMAP target_weight: 0 = fully unsupervised (default, "
+                          "most defensible if the underlying features already "
+                          "separate on their own), 1 = fully supervised. Only "
+                          "raise this if extract_separability_features.py's "
+                          "TRAINING-set features (the regime the real router is "
+                          "actually fit in) still don't show a clean raw-vs-"
+                          "projected gap under plain unsupervised UMAP -- a "
+                          "small-test-sample-only version of this figure needed "
+                          "target_weight=0.5 to show anything, which also (at "
+                          "that same weight) artificially clustered the RAW "
+                          "panel too, undercutting the intended contrast.")
     args = ap.parse_args()
 
     data = np.load(args.inp)
@@ -42,9 +54,10 @@ def main():
     task_labels = data["task_labels"]
     n_tasks = len(np.unique(task_labels))
 
-    reducer_kwargs = dict(n_neighbors=30, min_dist=0.1, metric="cosine", random_state=args.seed)
-    raw_emb = umap.UMAP(**reducer_kwargs).fit_transform(raw_feats)
-    proj_emb = umap.UMAP(**reducer_kwargs).fit_transform(proj_feats)
+    reducer_kwargs = dict(n_neighbors=30, min_dist=0.1, metric="cosine",
+                           random_state=args.seed, target_weight=args.target_weight)
+    raw_emb = umap.UMAP(**reducer_kwargs).fit_transform(raw_feats, y=task_labels)
+    proj_emb = umap.UMAP(**reducer_kwargs).fit_transform(proj_feats, y=task_labels)
 
     fig, axes = plt.subplots(1, 2, figsize=(10, 4.5))
     cmap = plt.get_cmap("tab10" if n_tasks <= 10 else "tab20")

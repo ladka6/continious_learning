@@ -10,6 +10,17 @@ seed is hardcoded and independent of the run's own --seed, so it is
 identical across every PRISM run regardless of which checkpoint/seed this
 script loads).
 
+Extracts from each task's TRAINING data (train_loader_for_protonet), the
+same loader replace_fc() uses to fit the real router, not the small
+held-out test set: a first version of this script used ~150 test
+samples/task and its UMAP plot showed almost no raw-vs-projected
+separation gap even though the extraction itself was verified correct (a
+linear probe on the raw features matched the published 37.4% almost
+exactly) -- because a ridge classifier fit on only ~150 points/task in a
+15000-dim projected space is nowhere near the well-conditioned regime the
+real router benefits from when fit on the full accumulated training set.
+Using the training data directly closes that regime gap.
+
 This does NOT train anything: it replays the config's task boundaries via
 _setup_task_loaders (the offline-replay path _setup_task_loaders was split
 out for, see its docstring in prism.py) and loads the already-trained
@@ -20,7 +31,7 @@ representation, before any task-specific adaptation.
 Usage (run on Snellius, from continious_learning/):
     python extract_separability_features.py \
         --config exps/ablation/router_relu15k.json --seed 1993 \
-        --n-per-task 150 --out separability_features.npz
+        --n-per-task 500 --out separability_features.npz
 """
 import argparse
 import copy
@@ -37,7 +48,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", default="exps/ablation/router_relu15k.json")
     ap.add_argument("--seed", type=int, default=1993)
-    ap.add_argument("--n-per-task", type=int, default=150)
+    ap.add_argument("--n-per-task", type=int, default=500)
     ap.add_argument("--out", default="separability_features.npz")
     cli = ap.parse_args()
 
@@ -59,32 +70,35 @@ def main():
     model._device = device
     model._network.to(device)
 
-    # Offline replay: walk every task boundary without training, so
-    # _task_ranges/_known_classes/_total_classes end up exactly as they were
-    # after the real training run finished, then reload its AdaptMLP.
-    # after_task() must run each iteration too -- _known_classes only
-    # advances there, not in _setup_task_loaders, so skipping it would leave
-    # _known_classes stuck at 0 and every task_ranges entry identically
-    # (0, task_size) instead of the real cumulative boundaries. reset_tosca()
-    # inside after_task() is harmless here since this script never touches
-    # TOSCA-adapted features, only the frozen backbone.
-    for _ in range(data_manager.nb_tasks):
-        model._setup_task_loaders(data_manager)
-        model.after_task()
+    # _ckpt_dir() (used by _load_adaptmlp) keys only on dataset/prefix/seed,
+    # not on task state, so this can run before or after the replay loop;
+    # doing it first mirrors the real run's order (AdaptMLP is trained once,
+    # during task 0, before any later task runs).
     model._load_adaptmlp()
     model._network.eval()
 
     raw_feats, proj_feats, task_labels = [], [], []
     with torch.no_grad():
-        for _, inputs, targets in model.test_loader:
-            inputs = inputs.to(device)
-            targets = targets.long()
-            feats = model._extract_backbone_features(inputs)  # frozen [CLS], [B, 768]
-            proj = model._router_features(feats)  # normalize -> project -> ReLU, [B, M]
-            true_task = model._true_task_from_targets(targets.to(device))
-            raw_feats.append(feats.cpu())
-            proj_feats.append(proj.cpu().half())  # half precision: M=15000 is large
-            task_labels.append(true_task.cpu())
+        for _ in range(data_manager.nb_tasks):
+            # _setup_task_loaders rebuilds train_loader_for_protonet for
+            # JUST this task's own new classes (mode="test" transforms on
+            # the training split) -- the exact loader replace_fc() uses to
+            # fit the real router, task by task, as training proceeds.
+            model._setup_task_loaders(data_manager)
+            cur_task = model._cur_task
+            for _, inputs, targets in model.train_loader_for_protonet:
+                inputs = inputs.to(device)
+                feats = model._extract_backbone_features(inputs)  # frozen [CLS], [B, 768]
+                proj = model._router_features(feats)  # normalize -> project -> ReLU, [B, M]
+                raw_feats.append(feats.cpu())
+                proj_feats.append(proj.cpu().half())  # half precision: M=15000 is large
+                task_labels.append(torch.full((inputs.size(0),), cur_task, dtype=torch.long))
+            # after_task() must still run each iteration -- _known_classes
+            # only advances there, not in _setup_task_loaders, and the NEXT
+            # iteration's task-boundary bookkeeping depends on it. Its
+            # reset_tosca() is harmless here since this script never touches
+            # TOSCA-adapted features, only the frozen backbone.
+            model.after_task()
 
     raw_feats = torch.cat(raw_feats, dim=0).numpy()
     proj_feats = torch.cat(proj_feats, dim=0).numpy()

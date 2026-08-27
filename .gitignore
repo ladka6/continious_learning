@@ -13,4 +13,6 @@ Screenshot*
 /tosca
 /results
 *.pth
+*.npz
+router_forgetting.json
 all_datasets_results.txt
