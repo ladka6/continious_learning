@@ -691,14 +691,25 @@ class Learner(BaseLearner):
         return out_logits
 
     def _task_scores_from_logits(self, logits):
-        """Class logits [B, C] -> per-task score [B, num_tasks] (max class in
-        each task's block). Used to route from the global ridge's own output."""
+        """Class logits [B, C] -> per-task score [B, num_tasks]. Used to route
+        from the global ridge's own class-level output.
+
+        router_task_reduction (default 'max'): the routing decision is driven
+        by whichever SINGLE class anywhere has the highest raw ridge score --
+        one confidently-scored class in the wrong task's block can outvote
+        every class in the sample's true task. 'sum' pools every class score
+        within each task's block instead, so one outlier class is diluted by
+        its (equal-count, since increments are uniform per dataset) siblings
+        rather than deciding routing alone -- a hypothesis for why routing
+        errors concentrate the way Group 1's ablation shows on ImageNet-A."""
         device = logits.device
+        reduction = str(self.args.get("router_task_reduction", "max"))
         scores = torch.full(
             (logits.size(0), len(self._task_ranges)), float("-inf"), device=device
         )
         for t, (start, end) in enumerate(self._task_ranges):
-            scores[:, t] = logits[:, start:end].max(dim=1).values
+            block = logits[:, start:end]
+            scores[:, t] = block.sum(dim=1) if reduction == "sum" else block.max(dim=1).values
         return scores
 
     def _get_global_routed_ridge_logits(self, inputs, oracle_tasks=None, lam=None):

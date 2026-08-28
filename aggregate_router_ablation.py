@@ -22,6 +22,7 @@ VARIANTS = [
     ("relu10k", "Proj + ReLU ridge, M=10000 (RanPAC)"),
     ("relu15k", "Proj + ReLU ridge, M=15000 (ours)"),
     ("relu20k", "Proj + ReLU ridge, M=20000"),
+    ("sum", "Proj + ReLU ridge, M=15000, sum-pooled task score"),
     # Group 2: learned gates (incremental), M=15000
     ("gate_lin", "Learned linear gate (no ReLU)"),
     ("gate_linrelu", "Learned linear gate (ReLU proj)"),
