@@ -971,6 +971,16 @@ class Learner(BaseLearner):
         y_pred, y_true = [], []
         route_correct, route_total = 0, 0
         log_routing = bool(self.args.get("log_routing_acc", False))
+        # torch.topk(k=self.topk) below needs total_classes >= self.topk, and
+        # base.py's _evaluate() (called right after this returns) hardcodes
+        # the SAME self.topk when tiling y_true against y_pred.T -- every
+        # existing config has >=5 classes even at task 0, but a fine-grained
+        # task split (e.g. init_cls=2 or 4 for a 50/100-task granularity
+        # ablation) does not. Clamping self.topk itself (not just the
+        # torch.topk call) keeps both call sites consistent; this is a
+        # no-op (min(5, total_classes) == 5) for every config with >=5
+        # classes at this stage, i.e. everything published so far.
+        self.topk = min(5, self._total_classes)
 
         for _, (_, inputs, targets) in enumerate(loader):
             inputs, targets = inputs.to(self._device), targets.long().to(self._device)
