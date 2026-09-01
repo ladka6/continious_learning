@@ -33,7 +33,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
-from sklearn.discriminant_analysis import LinearDiscriminantAnalysis
+from sklearn.manifold import TSNE
 
 RIDGE_LAMBDA = 1000.0
 
@@ -75,6 +75,10 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--in", dest="inp", default="separability_features_full.npz")
     ap.add_argument("--out", default="paper/figs/fig_separability_router_space.pdf")
+    ap.add_argument("--legend-fontsize", type=float, default=9,
+                     help="Font size of the T1/T2/T3... legend labels below the plots.")
+    ap.add_argument("--title-fontsize", type=float, default=10,
+                     help="Font size of each subplot's title (dataset name + routing acc).")
     args = ap.parse_args()
 
     data = np.load(args.inp)
@@ -108,20 +112,41 @@ def main():
         )
         print(f"{title}: replicated routing accuracy = {routing_acc:.2f}%  "
               f"(train n={X_train.shape[0]}, test n={X_test.shape[0]})")
-        emb = LinearDiscriminantAnalysis(n_components=2).fit_transform(task_scores, test_task)
+        # Unsupervised (labels used only for coloring, not for the projection
+        # itself) -- unlike LDA, t-SNE can't manufacture separation that
+        # isn't in the underlying task_scores, so the raw-vs-proj contrast
+        # here is a more honest demonstration of the router-space gap.
+        emb = TSNE(n_components=2, perplexity=50, init="pca",
+                   random_state=0).fit_transform(task_scores)
         for t in range(n_tasks):
             mask = test_task == t
             ax.scatter(emb[mask, 0], emb[mask, 1], s=6, alpha=0.7,
                        color=cmap(t % cmap.N), label=f"T{t+1}")
-        ax.set_title(f"{title}\nrouting acc: {routing_acc:.1f}%", fontsize=10)
+        ax.set_title(f"{title}\nrouting acc: {routing_acc:.1f}%", fontsize=args.title_fontsize)
         ax.set_xticks([])
         ax.set_yticks([])
 
-    handles, labels = axes[0].get_legend_handles_labels()
-    fig.legend(handles, labels, loc="lower center", ncol=n_tasks, fontsize=7,
-               bbox_to_anchor=(0.5, -0.05), frameon=False)
     fig.tight_layout()
-    fig.savefig(args.out, bbox_inches="tight")
+
+    # A figure-level legend below the axes isn't accounted for by
+    # tight_layout (that only sees per-axes elements), so at small font
+    # sizes it happened to fit in tight_layout's leftover margin by luck --
+    # at larger sizes (or once it wraps to more rows) it just overlaps the
+    # plots above it. Fix: place it once, measure its REAL rendered height,
+    # then explicitly carve out that much bottom margin and re-anchor it
+    # inside that margin -- self-adjusting for any font size or row count,
+    # not just the specific numbers already tried.
+    handles, labels = axes[0].get_legend_handles_labels()
+    legend = fig.legend(handles, labels, loc="lower center", ncol=n_tasks,
+                         fontsize=args.legend_fontsize,
+                         bbox_to_anchor=(0.5, 0.0), frameon=False)
+    fig.canvas.draw()
+    legend_h_frac = legend.get_window_extent().transformed(
+        fig.transFigure.inverted()
+    ).height
+    pad_frac = 0.03
+    fig.subplots_adjust(bottom=legend_h_frac + pad_frac)
+    fig.savefig(args.out, bbox_inches=None)
     print(f"Wrote {args.out}")
 
 
