@@ -971,16 +971,20 @@ class Learner(BaseLearner):
         y_pred, y_true = [], []
         route_correct, route_total = 0, 0
         log_routing = bool(self.args.get("log_routing_acc", False))
-        # torch.topk(k=self.topk) below needs total_classes >= self.topk, and
-        # base.py's _evaluate() (called right after this returns) hardcodes
-        # the SAME self.topk when tiling y_true against y_pred.T -- every
-        # existing config has >=5 classes even at task 0, but a fine-grained
-        # task split (e.g. init_cls=2 or 4 for a 50/100-task granularity
-        # ablation) does not. Clamping self.topk itself (not just the
-        # torch.topk call) keeps both call sites consistent; this is a
-        # no-op (min(5, total_classes) == 5) for every config with >=5
-        # classes at this stage, i.e. everything published so far.
-        self.topk = min(5, self._total_classes)
+        # torch.topk(k=self.topk) below needs total_classes >= self.topk.
+        # Earlier this was "fixed" by clamping self.topk itself, but that
+        # broke a DIFFERENT thing: base.py's _evaluate() then builds a
+        # dynamic "top{self.topk}" key (e.g. "top2"), while trainer.py
+        # hardcodes the literal string "top5" when reading the returned
+        # dict back -- KeyError. Correct fix: leave self.topk alone (stays
+        # 5 always, so both call sites keep agreeing on the key), and
+        # instead clamp only the actual torch.topk call below, padding
+        # its output back out to a constant self.topk columns with -1 (a
+        # sentinel no real class index can ever equal, so it just never
+        # counts as a top-5 hit -- an honest underestimate for tasks with
+        # under 5 classes, not a wrong answer). No-op whenever
+        # total_classes >= 5, i.e. every config published so far.
+        k = min(self.topk, self._total_classes)
 
         for _, (_, inputs, targets) in enumerate(loader):
             inputs, targets = inputs.to(self._device), targets.long().to(self._device)
@@ -994,8 +998,14 @@ class Learner(BaseLearner):
                     route_correct += (top1_task == true_task).sum().item()
                     route_total += targets.size(0)
             predicts = torch.topk(
-                outputs, k=self.topk, dim=1, largest=True, sorted=True
+                outputs, k=k, dim=1, largest=True, sorted=True
             )[1]
+            if k < self.topk:
+                pad = torch.full(
+                    (predicts.size(0), self.topk - k), -1,
+                    dtype=predicts.dtype, device=predicts.device,
+                )
+                predicts = torch.cat([predicts, pad], dim=1)
             y_pred.append(predicts.cpu().numpy())
             y_true.append(targets.cpu().numpy())
 
